@@ -1,5 +1,5 @@
 // =====================================================================
-//  СБОРКА ПК — симулятор мастерской по сборке компьютеров (3D)
+//  СБОРКА ПК — мастерская компьютеров: бери заказы, покупай детали, собирай ПК в 3D, тестируй и сдавай
 //  C++ + SDL для ccdroid / C4droid. Один файл, внешних библиотек нет.
 //  Если не собирается: ниже поставь SDL_MODE 1 (SDL 1.2) или 2 (SDL2).
 // =====================================================================
@@ -29,6 +29,7 @@
   #pragma GCC optimize("O2")      // если среда собирает без оптимизации, включаем её для этого файла
 #endif
 #include <vector>
+#include <cstddef>
 #include <map>
 #if defined(__unix__) || defined(__linux__) || defined(__ANDROID__) || defined(__APPLE__)
   #include <unistd.h>
@@ -59,6 +60,14 @@ static inline V3 cross(V3 a, V3 b) { return v3(a.y * b.z - a.z * b.y, a.z * b.x 
 static inline V3 vnorm(V3 a) { float l = sqrtf(dot(a, a)); if (l < 1e-8f) l = 1; return a * (1.0f / l); }
 
 typedef uint32_t u32;
+// ---- видеокарта (OpenGL ES 2): 3D рисует GPU, а 2D-интерфейс кладётся поверх прозрачной картинкой ----
+static bool gGL = false;          // рисуем ли 3D видеокартой
+static bool gWantGL = false;      // пробовать ли видеокарту при запуске (можно выключить в меню)
+static bool gOverlay = false;     // fb - прозрачный слой интерфейса поверх 3D (альфа в старшем байте)
+struct GV { float x, y, z; unsigned char r, g, b, a; };
+static std::vector<GV> gVerts;    // треугольники 3D за кадр (в координатах камеры)
+static unsigned gSkyCol = 0;
+static float gNearZ = 0.3f;   // ближе этой дистанции полигоны обрезаются (в квартире - 0.06, чтобы стены не просвечивали)
 static inline u32 RGB(int r, int g, int b) {
   r = clampi(r, 0, 255); g = clampi(g, 0, 255); b = clampi(b, 0, 255);
   return ((u32)r << 16) | ((u32)g << 8) | (u32)b;
@@ -76,7 +85,7 @@ static u32 shadec(u32 c, float f) { return RGB((int)(CR(c) * f), (int)(CG(c) * f
 
 // ---------- Экран и буферы ----------
 static int SW = 800, SH = 480, IW = 400, IH = 240, fs = 2;
-static int LW = 800, LH = 480;      // логический (горизонтальный) размер экрана
+static int LW = 480, LH = 800;      // логический размер экрана (игра вертикальная)
 static bool rotMode = false;        // экран вертикальный -> картинку поворачиваем
 static int rotDir = 1;              // 1 = по часовой, -1 = против
 static int quality = 1;              // 0 низкая, 1 средняя, 2 высокая (разрешение картинки)
@@ -112,11 +121,106 @@ static Ptr P;
 static SDL_Window *gWin = NULL;
 static SDL_Renderer *gRen = NULL;
 static SDL_Texture *gTex = NULL;
+static SDL_GLContext gCtx = NULL;
+
+// ======================= OpenGL ES 2 =======================
+typedef unsigned int GLenum; typedef unsigned int GLuint; typedef int GLint; typedef int GLsizei; typedef float GLfloat; typedef unsigned char GLboolean; typedef char GLchar; typedef unsigned int GLbitfield; typedef ptrdiff_t GLsizeiptr;
+#define GLF(ret, name, args) typedef ret (*PFN_##name) args; static PFN_##name p_##name = NULL;
+GLF(void, glViewport, (GLint, GLint, GLsizei, GLsizei)) GLF(void, glClearColor, (GLfloat, GLfloat, GLfloat, GLfloat)) GLF(void, glClear, (GLbitfield))
+GLF(void, glEnable, (GLenum)) GLF(void, glDisable, (GLenum)) GLF(void, glDepthFunc, (GLenum)) GLF(void, glDepthMask, (GLboolean)) GLF(void, glBlendFunc, (GLenum, GLenum))
+GLF(GLuint, glCreateShader, (GLenum)) GLF(void, glShaderSource, (GLuint, GLsizei, const GLchar *const *, const GLint *)) GLF(void, glCompileShader, (GLuint))
+GLF(void, glGetShaderiv, (GLuint, GLenum, GLint *)) GLF(GLuint, glCreateProgram, (void)) GLF(void, glAttachShader, (GLuint, GLuint))
+GLF(void, glBindAttribLocation, (GLuint, GLuint, const GLchar *)) GLF(void, glLinkProgram, (GLuint)) GLF(void, glGetProgramiv, (GLuint, GLenum, GLint *))
+GLF(void, glUseProgram, (GLuint)) GLF(GLint, glGetUniformLocation, (GLuint, const GLchar *)) GLF(void, glUniform4f, (GLint, GLfloat, GLfloat, GLfloat, GLfloat))
+GLF(void, glUniform2f, (GLint, GLfloat, GLfloat)) GLF(void, glUniform1i, (GLint, GLint)) GLF(void, glBindBuffer, (GLenum, GLuint))
+GLF(void, glVertexAttribPointer, (GLuint, GLint, GLenum, GLboolean, GLsizei, const void *)) GLF(void, glEnableVertexAttribArray, (GLuint)) GLF(void, glDisableVertexAttribArray, (GLuint))
+GLF(void, glDrawArrays, (GLenum, GLint, GLsizei)) GLF(void, glGenTextures, (GLsizei, GLuint *)) GLF(void, glBindTexture, (GLenum, GLuint)) GLF(void, glDeleteTextures, (GLsizei, const GLuint *))
+GLF(void, glTexParameteri, (GLenum, GLenum, GLint)) GLF(void, glTexImage2D, (GLenum, GLint, GLint, GLsizei, GLsizei, GLint, GLenum, GLenum, const void *))
+GLF(void, glTexSubImage2D, (GLenum, GLint, GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, const void *)) GLF(void, glActiveTexture, (GLenum)) GLF(void, glPixelStorei, (GLenum, GLint))
+GLF(void, glReadPixels, (GLint, GLint, GLsizei, GLsizei, GLenum, GLenum, void *))
+#undef GLF
+static GLuint glProg3D = 0, glProg2D = 0, glTexUI = 0; static GLint uP = -1, uNF = -1, uTex = -1; static int glTexW = 0, glTexH = 0, glVW = 0, glVH = 0;
+static GLuint glMakeProg(const char *vs, const char *fs2) {
+  GLuint v = p_glCreateShader(0x8B31), f = p_glCreateShader(0x8B30); GLint ok = 0;
+  p_glShaderSource(v, 1, &vs, NULL); p_glCompileShader(v); p_glGetShaderiv(v, 0x8B81, &ok); if (!ok) return 0;
+  p_glShaderSource(f, 1, &fs2, NULL); p_glCompileShader(f); p_glGetShaderiv(f, 0x8B81, &ok); if (!ok) return 0;
+  GLuint p = p_glCreateProgram(); p_glAttachShader(p, v); p_glAttachShader(p, f);
+  p_glBindAttribLocation(p, 0, "aP"); p_glBindAttribLocation(p, 1, "aC"); p_glLinkProgram(p); p_glGetProgramiv(p, 0x8B82, &ok);
+  return ok ? p : 0;
+}
+// loader - функция, которая по имени даёт адрес функции GL (SDL_GL_GetProcAddress или eglGetProcAddress)
+static bool glSetup(void *(*loader)(const char *)) {
+  #define LD(n) p_##n = (PFN_##n)loader(#n); if (!p_##n) return false;
+  LD(glViewport) LD(glClearColor) LD(glClear) LD(glEnable) LD(glDisable) LD(glDepthFunc) LD(glDepthMask) LD(glBlendFunc) LD(glCreateShader) LD(glShaderSource)
+  LD(glCompileShader) LD(glGetShaderiv) LD(glCreateProgram) LD(glAttachShader) LD(glBindAttribLocation) LD(glLinkProgram) LD(glGetProgramiv) LD(glUseProgram)
+  LD(glGetUniformLocation) LD(glUniform4f) LD(glUniform2f) LD(glUniform1i) LD(glBindBuffer) LD(glVertexAttribPointer) LD(glEnableVertexAttribArray)
+  LD(glDisableVertexAttribArray) LD(glDrawArrays) LD(glGenTextures) LD(glBindTexture) LD(glDeleteTextures) LD(glTexParameteri) LD(glTexImage2D) LD(glTexSubImage2D)
+  LD(glActiveTexture) LD(glPixelStorei)
+  #undef LD
+  p_glReadPixels = (PFN_glReadPixels)loader("glReadPixels");
+  // 3D: точки уже в координатах камеры; проекция как у программного движка (focal, vcx, vcy), глубина - видеокартой
+  glProg3D = glMakeProg(
+    "attribute vec3 aP; attribute vec4 aC; uniform vec4 uP; uniform vec2 uNF; varying vec4 vC;\n"
+    "void main(){ vC = aC; gl_Position = vec4(aP.x * uP.x + uP.y * aP.z, aP.y * uP.z + uP.w * aP.z, aP.z * uNF.x + uNF.y, aP.z); }\n",
+    "precision mediump float; varying vec4 vC; void main(){ gl_FragColor = vC; }\n");
+  // 2D: картинка интерфейса поверх (в памяти байты B,G,R,A - переставляем)
+  glProg2D = glMakeProg(
+    "attribute vec2 aP; varying vec2 vT; void main(){ vT = vec2(aP.x * 0.5 + 0.5, 0.5 - aP.y * 0.5); gl_Position = vec4(aP, 0.0, 1.0); }\n",
+    "precision mediump float; varying vec2 vT; uniform sampler2D uTex; void main(){ vec4 t = texture2D(uTex, vT); gl_FragColor = vec4(t.b, t.g, t.r, t.a); }\n");
+  if (!glProg3D || !glProg2D) return false;
+  uP = p_glGetUniformLocation(glProg3D, "uP"); uNF = p_glGetUniformLocation(glProg3D, "uNF"); uTex = p_glGetUniformLocation(glProg2D, "uTex");
+  p_glGenTextures(1, &glTexUI);
+  return true;
+}
+static void glUITex(int w, int h) {
+  if (glTexW == w && glTexH == h) return;
+  p_glBindTexture(0x0DE1, glTexUI);
+  p_glTexParameteri(0x0DE1, 0x2801, 0x2600); p_glTexParameteri(0x0DE1, 0x2800, 0x2600);      // NEAREST: пиксельный шрифт чёткий
+  p_glTexParameteri(0x0DE1, 0x2802, 0x812F); p_glTexParameteri(0x0DE1, 0x2803, 0x812F);
+  p_glTexImage2D(0x0DE1, 0, 0x1908, w, h, 0, 0x1908, 0x1401, NULL); glTexW = w; glTexH = h;
+}
+// кадр: очистка, все 3D-треугольники одним вызовом, потом интерфейс поверх
+static void glFrame(int vw, int vh) {
+  p_glViewport(0, 0, vw, vh);
+  p_glClearColor(((gSkyCol >> 16) & 255) / 255.0f, ((gSkyCol >> 8) & 255) / 255.0f, (gSkyCol & 255) / 255.0f, 1.0f);
+  p_glClear(0x4000 | 0x100);
+  if (!gVerts.empty()) {
+    p_glEnable(0x0B71); p_glDepthFunc(0x0203); p_glDepthMask(1); p_glDisable(0x0BE2); p_glDisable(0x0B44);
+    p_glUseProgram(glProg3D); p_glBindBuffer(0x8892, 0);
+    float n = fmaxv(0.02f, gNearZ), f = 120.0f;
+    p_glUniform4f(uP, 2.0f * focal / IW, 2.0f * vcx / IW - 1.0f, 2.0f * focal / IH, 1.0f - 2.0f * vcy / IH);
+    p_glUniform2f(uNF, (f + n) / (f - n), -2.0f * f * n / (f - n));
+    p_glEnableVertexAttribArray(0); p_glEnableVertexAttribArray(1);
+    p_glVertexAttribPointer(0, 3, 0x1406, 0, sizeof(GV), &gVerts[0].x);
+    p_glVertexAttribPointer(1, 4, 0x1401, 1, sizeof(GV), &gVerts[0].r);
+    p_glDrawArrays(4, 0, (GLsizei)gVerts.size());
+    p_glDisableVertexAttribArray(1);
+  }
+  p_glDisable(0x0B71); p_glEnable(0x0BE2); p_glBlendFunc(0x0302, 0x0303);
+  p_glUseProgram(glProg2D); p_glActiveTexture(0x84C0); glUITex(IW, IH); p_glBindTexture(0x0DE1, glTexUI);
+  p_glPixelStorei(0x0CF5, 4); p_glTexSubImage2D(0x0DE1, 0, 0, 0, IW, IH, 0x1908, 0x1401, fb); p_glUniform1i(uTex, 0);
+  static const float quad[8] = {-1, -1, 1, -1, -1, 1, 1, 1};
+  p_glEnableVertexAttribArray(0); p_glVertexAttribPointer(0, 2, 0x1406, 0, 0, quad); p_glDrawArrays(5, 0, 4);
+  gVerts.clear();
+  memset(fb, 0, sizeof(u32) * IW * IH);          // интерфейс следующего кадра - на прозрачном фоне
+}
+
+static void *sdlGLProc(const char *n) { return SDL_GL_GetProcAddress(n); }
 static bool gfxInit() {
   if (SDL_Init(SDL_INIT_VIDEO) < 0) return false;
   SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight");
   SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
-  gWin = SDL_CreateWindow("PCBuilder", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 0, 0,
+  if (gWantGL) {                                   // пробуем видеокарту; не вышло - обычный режим
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2); SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24); SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    gWin = SDL_CreateWindow("Bitva bashen", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 0, 0, SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_SHOWN | SDL_WINDOW_OPENGL);
+    if (gWin) { gCtx = SDL_GL_CreateContext(gWin);
+      if (!gCtx) { SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 16); gCtx = SDL_GL_CreateContext(gWin); }
+      if (gCtx && glSetup(sdlGLProc)) { SDL_GL_SetSwapInterval(1); SDL_GetWindowSize(gWin, &SW, &SH); gGL = true; gOverlay = true; return true; }
+      if (gCtx) SDL_GL_DeleteContext(gCtx); gCtx = NULL; SDL_DestroyWindow(gWin); gWin = NULL; }
+  }
+  gWin = SDL_CreateWindow("Bitva bashen", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 0, 0,
                           SDL_WINDOW_FULLSCREEN_DESKTOP | SDL_WINDOW_SHOWN);
   if (!gWin) return false;
   SDL_GetWindowSize(gWin, &SW, &SH);
@@ -125,11 +229,13 @@ static bool gfxInit() {
   return true;
 }
 static void gfxTex() {
+  if (gGL) return;
   if (gTex) SDL_DestroyTexture(gTex);
   gTex = SDL_CreateTexture(gRen, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, IW, IH);
 }
 static void gfxResize() {}
 static void gfxPresent() {
+  if (gGL) { int dw = SW, dh = SH; SDL_GL_GetDrawableSize(gWin, &dw, &dh); glFrame(dw, dh); SDL_GL_SwapWindow(gWin); return; }
   SDL_UpdateTexture(gTex, NULL, fb, IW * 4);
   SDL_RenderClear(gRen);
   if (rotMode) {
@@ -303,7 +409,7 @@ static const char *pth(const char *name) {
   snprintf(gPathBuf[gPathI], sizeof gPathBuf[0], "%s%s", gBase, name);
   return gPathBuf[gPathI];
 }
-static const char *CFGF = "pcbuilder.cfg";
+static const char *CFGF = "sborka.cfg";
 static int autoInset() { return rotMode ? SH * 19 / 1000 : 0; }
 static void saveCfg() {
   FILE *f = fopen(pth(CFGF), "w");
@@ -403,7 +509,8 @@ static void fillRect(int x, int y, int w, int h, u32 c) {
   int x0 = imax(x, 0), y0 = imax(y, 0), x1 = imin(x + w, IW), y1 = imin(y + h, IH);
   for (int j = y0; j < y1; j++) {
     u32 *r = fb + j * IW;
-    for (int i = x0; i < x1; i++) r[i] = c;
+    if (gOverlay) { u32 cc = c | 0xFF000000u; for (int i = x0; i < x1; i++) r[i] = cc; }
+    else for (int i = x0; i < x1; i++) r[i] = c;
   }
 }
 static void fillRectA(int x, int y, int w, int h, u32 c, int a) {   // a: 0..255
@@ -413,6 +520,8 @@ static void fillRectA(int x, int y, int w, int h, u32 c, int a) {   // a: 0..255
     u32 *r = fb + j * IW;
     for (int i = x0; i < x1; i++) {
       u32 d = r[i];
+      if (gOverlay) { u32 da = d >> 24; if (!da) { r[i] = (c & 0xFFFFFFu) | ((u32)a << 24); continue; }
+        r[i] = RGB((CR(d) * ia + CR(c) * a) / 255, (CG(d) * ia + CG(c) * a) / 255, (CB(d) * ia + CB(c) * a) / 255) | ((da + (255 - da) * a / 255) << 24); continue; }
       r[i] = RGB((CR(d) * ia + CR(c) * a) / 255, (CG(d) * ia + CG(c) * a) / 255, (CB(d) * ia + CB(c) * a) / 255);
     }
   }
@@ -427,6 +536,8 @@ static void fillCircle(int cx, int cy, int r, u32 c, int a) {
       int x = cx + i;
       if ((unsigned)x >= (unsigned)IW) continue;
       u32 d = fb[y * IW + x];
+      if (gOverlay) { u32 da = d >> 24; if (!da) { fb[y * IW + x] = (c & 0xFFFFFFu) | ((u32)a << 24); continue; }
+        fb[y * IW + x] = RGB((CR(d) * ia + CR(c) * a) / 255, (CG(d) * ia + CG(c) * a) / 255, (CB(d) * ia + CB(c) * a) / 255) | ((da + (255 - da) * a / 255) << 24); continue; }
       fb[y * IW + x] = RGB((CR(d) * ia + CR(c) * a) / 255, (CG(d) * ia + CG(c) * a) / 255, (CB(d) * ia + CB(c) * a) / 255);
     }
   }
@@ -542,9 +653,17 @@ static void rasterTriShadow(float x0, float y0, float w0, float x1, float y1, fl
 }
 static void drawPolyView(const V3 *in, int n, u32 col, int shadowK = 0) {
   if (gDry) return;
+  if (gGL) {
+    if (shadowK || n < 3) return;
+    bool any = false; for (int i = 0; i < n; i++) if (in[i].z > gNearZ) { any = true; break; } if (!any) return;   // целиком за камерой
+    unsigned char cr = (col >> 16) & 255, cg = (col >> 8) & 255, cb = col & 255;
+    for (int i = 1; i + 1 < n; i++) { const V3 *t[3] = {&in[0], &in[i], &in[i + 1]};
+      for (int k = 0; k < 3; k++) { GV g; g.x = t[k]->x; g.y = t[k]->y; g.z = t[k]->z; g.r = cr; g.g = cg; g.b = cb; g.a = 255; gVerts.push_back(g); } }
+    return;
+  }
   V3 v[32];
   int m = 0;
-  const float NZ = 0.3f;
+  const float NZ = gNearZ;
   for (int i = 0; i < n; i++) {
     V3 a = in[i], b = in[(i + 1) % n];
     bool ia = a.z >= NZ, ib = b.z >= NZ;
@@ -716,7 +835,7 @@ static void drawPolyViewG(const V3 *in, const float (*cin)[3], int n) {
   V3 v[32];
   float cv[32][3];
   int m = 0;
-  const float NZ = 0.3f;
+  const float NZ = gNearZ;
   for (int i = 0; i < n; i++) {
     int j = (i + 1) % n;
     V3 a = in[i], b = in[j];
@@ -866,10 +985,12 @@ static void drawWheel(V3 c, V3 ax, V3 ay, V3 az, float r, float hw, u32 col) {
 
 static void setClipRect(int x0, int y0, int x1, int y1) { clipX0 = x0; clipY0 = y0; clipX1 = x1; clipY1 = y1; }
 static void clearDepth() {
+  if (gGL) return;
   if (clipX0 == 0 && clipX1 == IW) { memset(zb + clipY0 * IW, 0, sizeof(float) * (size_t)(clipY1 - clipY0) * IW); return; }
   for (int y = clipY0; y < clipY1; y++) { float *r = zb + y * IW; for (int x = clipX0; x < clipX1; x++) r[x] = 0; }
 }
 static void fillSky() {
+  if (gGL) { gSkyCol = fogCol; return; }
   float horizon = vcy + focal * camF.y / sqrtf(fmaxv(0.05f, 1 - camF.y * camF.y));
   u32 top = mixc(RGB(60, 70, 110), RGB(6, 8, 26), gNight);
   for (int y = clipY0; y < clipY1; y++) {
@@ -917,594 +1038,678 @@ static void drawLine(int x0, int y0, int x1, int y1, u32 c, int th) {
   }
 }
 
-
 // =====================================================================
-//  СБОРКА ПК: детали, заказы, проверка сборки
+//  СБОРКА ПК: детали, заказы, сохранение
 // =====================================================================
-#include <algorithm>
-#include <string>
-enum { P_CASE, P_MB, P_CPU, P_COOLER, P_RAM, P_GPU, P_PSU, P_SSD, NPT };
-static const char *PTN[NPT] = {"КОРПУС", "ПЛАТА", "ПРОЦЕССОР", "КУЛЕР", "ПАМЯТЬ", "ВИДЕОКАРТА", "БЛОК ПИТАНИЯ", "ДИСК"};
-// a,b,c,d - свои у каждого типа:
-//  корпус: a размер (0 малый mATX, 1 большой ATX), b макс. длина видеокарты (мм), c цвет, d подсветка
-//  плата: a сокет (0 "АМ5", 1 "ЛГА"), b тип памяти (4/5), c слотов памяти, d размер (0 mATX, 1 ATX)
-//  процессор: a сокет, b мощность, c нагрев (Вт), d ядер
-//  кулер: a отводит Вт, b подсветка
-//  память: a тип (4/5), b ГБ
-//  видеокарта: a мощность, b нагрев (Вт), c длина (мм)
-//  блок питания: a Вт
-//  диск: a ГБ, b скорость (0 HDD, 1 SSD, 2 NVMe)
-struct Part { int type; const char *name; int price, tier, a, b, c, d; };
+enum { PT_CASE, PT_MB, PT_CPU, PT_COOL, PT_RAM, PT_SSD, PT_GPU, PT_PSU, NPT };
+static const char *PTN[NPT] = {"КОРПУС", "МАТ. ПЛАТА", "ПРОЦЕССОР", "КУЛЕР", "ПАМЯТЬ", "SSD", "ВИДЕОКАРТА", "БЛОК ПИТАНИЯ"};
+// a, b, c, d - смысл зависит от типа:
+//  КОРПУС: a - обдув (100 = обычный), b - подсветка, c - 1 только mATX, d - длина видеокарты, мм
+//  ПЛАТА:  a - сокет (0 А, 1 Б), b - память (4/5), c - 1 mATX
+//  ПРОЦ:   a - сокет, b - мощность, c - тепло, Вт
+//  КУЛЕР:  a - вид (0 боксовый, 1 башня, 2 двойная башня, 3 водянка 240, 4 водянка 360), b - подсветка, c - отводит Вт
+//  ПАМЯТЬ: a - частота, b - тип, c - ГБ
+//  SSD:    c - ГБ
+//  ВИДЕО:  b - мощность, c - потребление, Вт, d - длина, мм
+//  БП:     c - Вт
+struct Part { const char *name; int type, price, tier, a, b, c, d; u32 col; };
 static const Part PARTS[] = {
-  {P_CASE, "Корпус Бокс Мини", 2500, 1, 0, 260, 0, 0}, {P_CASE, "Корпус Тауэр", 4500, 1, 1, 330, 1, 0}, {P_CASE, "Корпус Стекло RGB", 8500, 2, 1, 380, 2, 1}, {P_CASE, "Корпус Титан XL", 14000, 3, 1, 420, 3, 1},
-  {P_MB, "Плата А-320М (АМ5, DDR4)", 5000, 1, 0, 4, 2, 0}, {P_MB, "Плата Б-550 (АМ5, DDR5)", 9500, 2, 0, 5, 4, 1}, {P_MB, "Плата Х-670 (АМ5, DDR5)", 18000, 3, 0, 5, 4, 1},
-  {P_MB, "Плата Н-610М (ЛГА, DDR4)", 5500, 1, 1, 4, 2, 0}, {P_MB, "Плата Б-760 (ЛГА, DDR5)", 10500, 2, 1, 5, 4, 1}, {P_MB, "Плата З-790 (ЛГА, DDR5)", 21000, 3, 1, 5, 4, 1},
-  {P_CPU, "Аргон 3 (АМ5, 4 ядра)", 6000, 1, 0, 30, 65, 4}, {P_CPU, "Аргон 5 (АМ5, 6 ядер)", 13000, 2, 0, 55, 95, 6}, {P_CPU, "Аргон 7 (АМ5, 8 ядер)", 24000, 3, 0, 80, 125, 8}, {P_CPU, "Аргон 9 (АМ5, 16 ядер)", 46000, 4, 0, 110, 170, 16},
-  {P_CPU, "Квант i3 (ЛГА, 4 ядра)", 6500, 1, 1, 32, 60, 4}, {P_CPU, "Квант i5 (ЛГА, 6 ядер)", 14000, 2, 1, 58, 110, 6}, {P_CPU, "Квант i7 (ЛГА, 12 ядер)", 27000, 3, 1, 85, 150, 12}, {P_CPU, "Квант i9 (ЛГА, 24 ядра)", 52000, 4, 1, 115, 220, 24},
-  {P_COOLER, "Кулер Коробочный", 800, 1, 70, 0, 0, 0}, {P_COOLER, "Кулер Башня 120", 2500, 1, 130, 0, 0, 0}, {P_COOLER, "Кулер Башня RGB", 4500, 2, 170, 1, 0, 0}, {P_COOLER, "Водянка 360 RGB", 11000, 3, 250, 1, 0, 0},
-  {P_RAM, "DDR4 8 ГБ", 1800, 1, 4, 8, 0, 0}, {P_RAM, "DDR4 16 ГБ", 3300, 1, 4, 16, 0, 0}, {P_RAM, "DDR5 16 ГБ", 4500, 2, 5, 16, 0, 0}, {P_RAM, "DDR5 32 ГБ", 8500, 3, 5, 32, 0, 0},
-  {P_GPU, "Вектор 1650 (мини)", 13000, 1, 30, 75, 180, 0}, {P_GPU, "Вектор 3060", 28000, 2, 60, 170, 240, 0}, {P_GPU, "Радон 7700", 39000, 2, 75, 230, 270, 0},
-  {P_GPU, "Вектор 4070", 58000, 3, 100, 220, 300, 0}, {P_GPU, "Радон 7900", 85000, 4, 130, 320, 340, 0}, {P_GPU, "Вектор 4090", 150000, 4, 170, 450, 360, 0},
-  {P_PSU, "БП 400 Вт", 2500, 1, 400, 0, 0, 0}, {P_PSU, "БП 550 Вт", 4000, 1, 550, 0, 0, 0}, {P_PSU, "БП 750 Вт", 7000, 2, 750, 0, 0, 0}, {P_PSU, "БП 1000 Вт", 12000, 3, 1000, 0, 0, 0},
-  {P_SSD, "HDD 1 ТБ", 3000, 1, 1000, 0, 0, 0}, {P_SSD, "SSD 256 ГБ", 2200, 1, 256, 1, 0, 0}, {P_SSD, "SSD 512 ГБ", 3500, 1, 512, 1, 0, 0}, {P_SSD, "NVMe 1 ТБ", 6500, 2, 1000, 2, 0, 0}, {P_SSD, "NVMe 2 ТБ", 12000, 3, 2000, 2, 0, 0},
+  {"КУБИК МИНИ",        PT_CASE, 3000,  0, 85,  0, 1, 250, RGB(60, 62, 70)},
+  {"СТАНДАРТ",          PT_CASE, 4500,  0, 100, 0, 0, 300, RGB(40, 42, 48)},
+  {"АЭРО СЕТКА",        PT_CASE, 7500,  1, 120, 0, 0, 340, RGB(225, 228, 232)},
+  {"БАШНЯ RGB",         PT_CASE, 12000, 2, 115, 1, 0, 400, RGB(28, 28, 34)},
+  {"ПЛАТА А-310 МИНИ",  PT_MB,   5000,  0, 0, 4, 1, 0, RGB(30, 90, 60)},
+  {"ПЛАТА А-550",       PT_MB,   8000,  0, 0, 4, 0, 0, RGB(35, 40, 45)},
+  {"ПЛАТА А-770 ПРО",   PT_MB,   15000, 2, 0, 5, 0, 0, RGB(25, 25, 30)},
+  {"ПЛАТА Б-410 МИНИ",  PT_MB,   5500,  0, 1, 4, 1, 0, RGB(30, 60, 100)},
+  {"ПЛАТА Б-660",       PT_MB,   11000, 1, 1, 5, 0, 0, RGB(40, 40, 50)},
+  {"ПЛАТА Б-790 ЭКСТРИМ",PT_MB,  19000, 3, 1, 5, 0, 0, RGB(20, 20, 24)},
+  {"КВАНТ К3",          PT_CPU,  6500,  0, 0, 30, 65, 0, RGB(200, 90, 40)},
+  {"КВАНТ К5",          PT_CPU,  13000, 0, 0, 55, 95, 0, RGB(200, 90, 40)},
+  {"КВАНТ К7",          PT_CPU,  24000, 2, 0, 80, 125, 0, RGB(200, 90, 40)},
+  {"КВАНТ К9",          PT_CPU,  42000, 4, 0, 100, 170, 0, RGB(200, 90, 40)},
+  {"ВЕКТОР В3",         PT_CPU,  6900,  0, 1, 32, 65, 0, RGB(50, 110, 210)},
+  {"ВЕКТОР В5",         PT_CPU,  14500, 1, 1, 58, 105, 0, RGB(50, 110, 210)},
+  {"ВЕКТОР В7",         PT_CPU,  27000, 3, 1, 85, 140, 0, RGB(50, 110, 210)},
+  {"ВЕКТОР В9",         PT_CPU,  48000, 5, 1, 105, 200, 0, RGB(50, 110, 210)},
+  {"КУЛЕР ПРОСТОЙ",     PT_COOL, 800,   0, 0, 0, 90, 0, RGB(60, 60, 65)},
+  {"БАШНЯ 120",         PT_COOL, 2500,  0, 1, 0, 150, 0, RGB(180, 185, 195)},
+  {"ДВОЙНАЯ БАШНЯ",     PT_COOL, 5000,  1, 2, 0, 200, 0, RGB(40, 40, 46)},
+  {"ВОДЯНКА 240",       PT_COOL, 9000,  2, 3, 0, 250, 0, RGB(30, 30, 36)},
+  {"ВОДЯНКА 360 RGB",   PT_COOL, 14000, 3, 4, 1, 320, 0, RGB(235, 235, 240)},
+  {"DDR4 8 ГБ",         PT_RAM,  1800,  0, 2666, 4, 8, 0, RGB(40, 120, 60)},
+  {"DDR4 16 ГБ",        PT_RAM,  3500,  0, 3200, 4, 16, 0, RGB(40, 40, 48)},
+  {"DDR4 32 ГБ",        PT_RAM,  7000,  1, 3600, 4, 32, 0, RGB(180, 40, 40)},
+  {"DDR5 16 ГБ",        PT_RAM,  5000,  1, 5200, 5, 16, 0, RGB(40, 40, 48)},
+  {"DDR5 32 ГБ RGB",    PT_RAM,  9500,  2, 6000, 5, 32, 0, RGB(235, 235, 240)},
+  {"DDR5 64 ГБ RGB",    PT_RAM,  19000, 4, 6400, 5, 64, 0, RGB(25, 25, 30)},
+  {"SSD 256 ГБ",        PT_SSD,  2000,  0, 0, 0, 256, 0, RGB(30, 30, 34)},
+  {"SSD 512 ГБ",        PT_SSD,  3500,  0, 0, 0, 512, 0, RGB(30, 30, 34)},
+  {"SSD 1 ТБ",          PT_SSD,  6000,  1, 0, 0, 1024, 0, RGB(40, 40, 120)},
+  {"SSD 2 ТБ",          PT_SSD,  11000, 3, 0, 0, 2048, 0, RGB(120, 30, 30)},
+  {"ГРОМ 1630",         PT_GPU,  9000,  0, 0, 20, 75, 180, RGB(60, 60, 66)},
+  {"ГРОМ 3050",         PT_GPU,  18000, 0, 0, 45, 130, 230, RGB(40, 40, 46)},
+  {"ПИКСЕЛЬ 6600",      PT_GPU,  22000, 1, 0, 55, 160, 240, RGB(150, 30, 30)},
+  {"ГРОМ 4060",         PT_GPU,  30000, 2, 0, 70, 170, 250, RGB(30, 30, 34)},
+  {"ПИКСЕЛЬ 7800",      PT_GPU,  45000, 3, 0, 85, 260, 300, RGB(170, 30, 30)},
+  {"ГРОМ 4080",         PT_GPU,  85000, 4, 0, 100, 320, 330, RGB(30, 30, 34)},
+  {"ГРОМ 4090 ТИТАН",   PT_GPU,  150000,5, 0, 130, 450, 350, RGB(200, 160, 40)},
+  {"БП 400 ВТ",         PT_PSU,  3500,  0, 0, 0, 400, 0, RGB(30, 30, 34)},
+  {"БП 550 ВТ",         PT_PSU,  5000,  0, 0, 0, 550, 0, RGB(30, 30, 34)},
+  {"БП 750 ВТ ЗОЛОТО",  PT_PSU,  8000,  1, 0, 0, 750, 0, RGB(30, 30, 34)},
+  {"БП 1000 ВТ",        PT_PSU,  13000, 3, 0, 0, 1000, 0, RGB(30, 30, 34)},
+  {"БП 1300 ВТ",        PT_PSU,  20000, 4, 0, 0, 1300, 0, RGB(30, 30, 34)},
 };
-static const int NPART = sizeof(PARTS) / sizeof(PARTS[0]);
-static const char *SOCK[2] = {"АМ5", "ЛГА"};
+static const int NPART = (int)(sizeof PARTS / sizeof PARTS[0]);
+static const int MAXPART = 64;
+static void partInfo(int i, char *b, int n) {                    // короткие характеристики для списка
+  const Part &p = PARTS[i];
+  switch (p.type) {
+    case PT_CASE: snprintf(b, n, "%s, ВИДЕО ДО %d ММ, ОБДУВ %d%%%s", p.c ? "ТОЛЬКО mATX" : "ATX И mATX", p.d, p.a, p.b ? ", RGB" : ""); break;
+    case PT_MB:   snprintf(b, n, "СОКЕТ %s, DDR%d, %s", p.a ? "Б" : "А", p.b, p.c ? "mATX" : "ATX"); break;
+    case PT_CPU:  snprintf(b, n, "СОКЕТ %s, МОЩНОСТЬ %d, ТЕПЛО %d ВТ", p.a ? "Б" : "А", p.b, p.c); break;
+    case PT_COOL: snprintf(b, n, "ОТВОДИТ %d ВТ%s", p.c, p.b ? ", RGB" : ""); break;
+    case PT_RAM:  snprintf(b, n, "DDR%d, %d ГБ, %d МГЦ%s", p.b, p.c, p.a, strstr(p.name, "RGB") ? ", RGB" : ""); break;
+    case PT_SSD:  snprintf(b, n, "%d ГБ", p.c); break;
+    case PT_GPU:  snprintf(b, n, "МОЩНОСТЬ %d, %d ВТ, ДЛИНА %d ММ", p.b, p.c, p.d); break;
+    case PT_PSU:  snprintf(b, n, "%d ВТ", p.c); break;
+  }
+}
+static void fmtMoney(char *b, int n, long long v) {             // 12 500 Р
+  char t[32]; snprintf(t, sizeof t, "%lld", v < 0 ? -v : v); int L = (int)strlen(t), o = 0; char r[48];
+  if (v < 0) r[o++] = '-';
+  for (int i = 0; i < L; i++) { r[o++] = t[i]; if ((L - i - 1) % 3 == 0 && i < L - 1) r[o++] = ' '; } r[o] = 0; snprintf(b, n, "%s Р", r);
+}
+
 // ---- заказы ----
-enum { O_OFFICE, O_GAME, O_EDIT, O_STREAM, NOTYPE };
-static const char *OTN[NOTYPE] = {"ОФИСНЫЙ", "ИГРОВОЙ", "ДЛЯ МОНТАЖА", "ДЛЯ СТРИМОВ"};
-static const char *GAMES[] = {"ТАНКИ 5", "КИБЕРГОРОД", "ГОНКИ ХОРАЙЗН", "СТРЕЛЯЛКА 2", "КОСМОС ОНЛАЙН"};
-static const char *CNAMES[] = {"Артём", "Света", "Дядя Коля", "Школьник Влад", "Блогер Ника", "Офис \"Ромашка\"", "Стример Макс", "Монтажёр Ира", "Бабушка Галя", "Геймер Тимур"};
-struct Order { int type, budget, fps, cpu, ram, disk, game, client; bool rgb, active, done; };
-static int cheapestPart(int type, int lvl, int a0, int a1, int need, int need2, int need3) {   // фильтр по полям для разных типов
-  int best = -1;
-  for (int i = 0; i < NPART; i++) {
-    const Part &p = PARTS[i]; if (p.type != type || p.tier > lvl) continue;
-    bool ok = true;
-    if (type == P_MB) ok = p.a == a0;
-    if (type == P_COOLER) ok = p.a >= need && (!need2 || p.b);
-    if (type == P_CASE) ok = p.a >= a0 && p.b >= need && (!need2 || p.d || need3);
-    if (type == P_PSU) ok = p.a >= need;
-    if (type == P_SSD) ok = p.a >= need;
-    if (ok && (best < 0 || p.price < PARTS[best].price)) best = i;
-  }
-  return best;
-}
-// ---- состояние ----
-struct Build { int part[NPT]; int ram[4]; int nram; bool paste, cables, closed; };
-static int money = 30000, rep = 0, day = 1, level = 1, paste = 3;
-static std::vector<int> inv;                    // склад деталей (номера в PARTS)
-static Order orders[3]; static int curOrder = -1;
-static Build bd;
-static bool tested = false; static int testFps = 0, testScore = 0; static std::vector<std::string> problems;
-static char msg[128] = ""; static float msgT = 0;
-static void say(const char *s) { snprintf(msg, sizeof msg, "%s", s); msgT = 3.0f; }
-static int levelOf(int r) { return r < 5 ? 1 : r < 15 ? 2 : r < 35 ? 3 : 4; }
-static void clearBuild() { for (int i = 0; i < NPT; i++) bd.part[i] = -1; bd.nram = 0; bd.paste = bd.cables = bd.closed = false; tested = false; problems.clear(); }
-static int planCost(const Order &o, int lvl);
-static void genOrder(Order &o) {
-  o.type = rand() % NOTYPE; if (level == 1 && o.type == O_STREAM) o.type = O_GAME;
-  o.client = rand() % 10; o.game = rand() % 5; o.rgb = rand() % 3 == 0 && level >= 2; o.active = true; o.done = false;
-  int lv = imin(4, level + (rand() % 3 == 0 ? 1 : 0));
-  switch (o.type) {
-    case O_OFFICE: o.fps = 0; o.cpu = 25 + rand() % 10; o.ram = 8; o.disk = 256; o.budget = 32000 + rand() % 8 * 1000; o.rgb = false; break;
-    case O_GAME:   o.fps = 40 + lv * 20 + rand() % 3 * 10; o.cpu = 0; o.ram = lv >= 3 ? 32 : 16; o.disk = 512; o.budget = 0; break;
-    case O_EDIT:   o.fps = 0; o.cpu = 50 + lv * 15; o.ram = lv >= 3 ? 64 : 32; o.disk = 1000; o.budget = 0; break;
-    default:       o.fps = 60 + lv * 15; o.cpu = 50 + lv * 10; o.ram = 32; o.disk = 1000; o.budget = 0; break;
-  }
-  // бюджет: самая дешёвая подходящая сборка + 15-40% (на работу); если собрать нельзя - ослабляем требования
-  int cost = -1;
-  for (int k = 0; k < 8; k++) { cost = planCost(o, imin(4, level + 1)); if (cost > 0) break; if (o.fps) o.fps = o.fps * 85 / 100; if (o.cpu) o.cpu = o.cpu * 85 / 100; if (o.ram > 16) o.ram /= 2; }
-  if (cost <= 0) { o.type = O_OFFICE; o.fps = 0; o.cpu = 25; o.ram = 8; o.disk = 256; o.rgb = false; cost = planCost(o, 4); }
-  o.budget = (int)(cost * (1.15f + (rand() % 26) / 100.0f)) / 500 * 500;
-}
-// ---- проверка сборки ----
-static const Part *PT(int t) { return bd.part[t] >= 0 ? &PARTS[bd.part[t]] : NULL; }
-static int ramGB() { int s = 0; for (int i = 0; i < bd.nram; i++) s += PARTS[bd.ram[i]].b; return s; }
-static int buildCost() { int c = 0; for (int i = 0; i < NPT; i++) if (bd.part[i] >= 0 && i != P_RAM) c += PARTS[bd.part[i]].price; for (int i = 0; i < bd.nram; i++) c += PARTS[bd.ram[i]].price; return c; }
-static int powerNeed() { int w = 60; if (PT(P_CPU)) w += PT(P_CPU)->c; if (PT(P_GPU)) w += PT(P_GPU)->b; return (int)(w * 1.25f); }
-static float cpuScore() { if (!PT(P_CPU)) return 0; float s = (float)PT(P_CPU)->b; if (!bd.paste || !PT(P_COOLER) || PT(P_COOLER)->a < PT(P_CPU)->c) s *= 0.6f; if (ramGB() < 16) s *= 0.85f; return s; }
-static int estFps(int game) {                    // FPS в игре: упирается в процессор или видеокарту
-  static const float heavy[5] = {0.9f, 1.4f, 1.15f, 0.8f, 1.05f};
-  float g = PT(P_GPU) ? PT(P_GPU)->a * 1.6f : cpuScore() * 0.2f, c = cpuScore() * 2.2f;
-  return (int)(fminv(g, c) / heavy[game]);
-}
-static bool hasRgb() { return (PT(P_CASE) && PT(P_CASE)->d) || (PT(P_COOLER) && PT(P_COOLER)->b); }
-static void checkBuild(std::vector<std::string> &pr, bool &boots) {
-  pr.clear(); boots = true;
-  const Part *cs = PT(P_CASE), *mb = PT(P_MB), *cpu = PT(P_CPU), *co = PT(P_COOLER), *gpu = PT(P_GPU), *psu = PT(P_PSU), *sd = PT(P_SSD);
-  if (!cs || !mb || !cpu || !psu || !bd.nram) { std::string s = "НЕ ХВАТАЕТ:"; if (!cs) s += " КОРПУС"; if (!mb) s += " ПЛАТА"; if (!cpu) s += " ПРОЦЕССОР"; if (!bd.nram) s += " ПАМЯТЬ"; if (!psu) s += " БЛОК ПИТАНИЯ"; pr.push_back(s); boots = false; }
-  if (cs && mb && mb->d > cs->a) { pr.push_back("ПЛАТА НЕ ВЛЕЗАЕТ В МАЛЫЙ КОРПУС"); boots = false; }
-  if (mb && cpu && mb->a != cpu->a) { pr.push_back("ПРОЦЕССОР НЕ ПОДХОДИТ К СОКЕТУ ПЛАТЫ"); boots = false; }
-  if (mb) for (int i = 0; i < bd.nram; i++) if (PARTS[bd.ram[i]].a != mb->b) { pr.push_back("ПАМЯТЬ НЕ ТОГО ТИПА (DDR4 / DDR5)"); boots = false; break; }
-  if (cpu && !co) { pr.push_back("НЕТ КУЛЕРА: ПРОЦЕССОР ПЕРЕГРЕВАЕТСЯ"); boots = false; }
-  if (cpu && co && !bd.paste) pr.push_back("ЗАБЫЛ ТЕРМОПАСТУ: ПЕРЕГРЕВ, ТОРМОЗИТ");
-  if (cpu && co && co->a < cpu->c) pr.push_back("СЛАБЫЙ КУЛЕР: ПОД НАГРУЗКОЙ ТОРМОЗИТ");
-  if (cs && gpu && gpu->c > cs->b) { pr.push_back("ВИДЕОКАРТА НЕ ВЛЕЗАЕТ В КОРПУС"); boots = false; }
-  if (psu && psu->a < powerNeed()) { char b[96]; snprintf(b, sizeof b, "БЛОК ПИТАНИЯ СЛАБЫЙ: НУЖНО %d ВТ", powerNeed()); pr.push_back(b); boots = false; }
-  if (!sd) { pr.push_back("НЕТ ДИСКА: НЕКУДА СТАВИТЬ СИСТЕМУ"); boots = false; }
-  if (!bd.cables) { pr.push_back("НЕ ПОДКЛЮЧЕНЫ ПРОВОДА"); boots = false; }
-}
+enum { OT_OFFICE, OT_STUDY, OT_GAME1, OT_MINI, OT_GAME2, OT_EDIT, OT_STREAM, OT_TOP, NOT };
+struct OrderType { const char *name; int lvl, minScore, pay, needGpu, minRam, mini, rgb, minSsd, minCpu; };
+static const OrderType OTYPES[NOT] = {
+  {"ОФИСНЫЙ ПК",          0, 1000,  28000,  0, 8,  0, 0, 256,  0},
+  {"ПК ДЛЯ УЧЁБЫ",        0, 1500,  34000,  0, 16, 0, 0, 512,  0},
+  {"ИГРОВОЙ НАЧАЛЬНЫЙ",   0, 4500,  68000,  1, 16, 0, 0, 512,  0},
+  {"МАЛЕНЬКИЙ ИГРОВОЙ",   1, 4500,  75000,  1, 16, 1, 0, 512,  0},
+  {"ИГРОВОЙ ПК",          2, 6800,  110000, 1, 16, 0, 0, 1024, 0},
+  {"ДЛЯ МОНТАЖА ВИДЕО",   2, 6000,  120000, 1, 32, 0, 0, 1024, 80},
+  {"ПК СТРИМЕРА",         3, 8500,  165000, 1, 32, 0, 1, 1024, 0},
+  {"ТОПОВЫЙ МОНСТР",      4, 12000, 330000, 1, 64, 0, 1, 2048, 100},
+};
+static const char *CLIENTS[16] = {"ИВАН", "МАРИНА", "ДЕД ПЕТРОВИЧ", "СТУДЕНТ ОЛЕГ", "АННА", "КИБЕРКЛУБ", "БУХГАЛТЕРИЯ", "БЛОГЕР ДИМА", "ШКОЛЬНИК ВАНЯ", "СЕРГЕЙ", "ДИЗАЙНЕР ЛЕНА", "СТРИМЕР КОТ", "ВЕБ-СТУДИЯ", "ПАПА АРТЁМА", "ГЕЙМЕР МАКС", "КАТЯ"};
+struct Order { int type, client, pay; bool live; };
 
-// самая дешёвая сборка под заказ (перебор процессоров и видеокарт); -1, если на этом уровне не собрать
-static int planCost(const Order &o, int lvl) {
-  Build keep = bd; int best = -1;
-  for (int c = 0; c < NPART; c++) {
-    const Part &cp = PARTS[c]; if (cp.type != P_CPU || cp.tier > lvl) continue;
-    for (int g = -1; g < NPART; g++) {
-      if (g >= 0 && (PARTS[g].type != P_GPU || PARTS[g].tier > lvl)) continue;
-      int mb = cheapestPart(P_MB, lvl, cp.a, 0, 0, 0, 0); if (mb < 0) continue; const Part &mp = PARTS[mb];
-      int ram = -1, nr = 0;
-      for (int r = 0; r < NPART; r++) { const Part &rp = PARTS[r]; if (rp.type != P_RAM || rp.tier > lvl || rp.a != mp.b) continue; int n = imax(1, (o.ram + rp.b - 1) / rp.b); if (n > mp.c) continue; if (ram < 0 || rp.price * n < PARTS[ram].price * nr) { ram = r; nr = n; } }
-      if (ram < 0) continue;
-      int co = cheapestPart(P_COOLER, lvl, 0, 0, cp.c, 0, 0); if (co < 0) continue;
-      int cs = cheapestPart(P_CASE, lvl, mp.d, 0, g >= 0 ? PARTS[g].c : 0, o.rgb, PARTS[co].b); if (cs < 0) continue;
-      int ps = cheapestPart(P_PSU, lvl, 0, 0, (int)((60 + cp.c + (g >= 0 ? PARTS[g].b : 0)) * 1.25f), 0, 0); if (ps < 0) continue;
-      int sd = cheapestPart(P_SSD, lvl, 0, 0, o.disk, 0, 0); if (sd < 0) continue;
-      for (int i = 0; i < NPT; i++) bd.part[i] = -1;
-      bd.part[P_CASE] = cs; bd.part[P_MB] = mb; bd.part[P_CPU] = c; bd.part[P_COOLER] = co; bd.part[P_GPU] = g; bd.part[P_PSU] = ps; bd.part[P_SSD] = sd;
-      bd.nram = nr; for (int i = 0; i < nr; i++) bd.ram[i] = ram; bd.paste = true; bd.cables = true;
-      if (o.fps && estFps(o.game) < o.fps) continue;
-      if (o.cpu && cpuScore() < o.cpu) continue;
-      int cost = buildCost(); if (best < 0 || cost < best) best = cost;
-    }
-  }
-  bd = keep;
-  return best;
+// ---- профиль и сохранение ----
+static const int NOFFER = 3;
+struct Save {
+  long long money; int rep, day, delivered, best; int inv[MAXPART]; int slot[NPT]; int cab[3];
+  Order offer[NOFFER]; int active; bool soundOn; int tutorial;
+};
+static Save S;
+static int repLevel() { return clampi(S.rep / 20, 0, 5); }
+static void newOrder(Order &o) {
+  int lv = repLevel(), cand[NOT], n = 0; for (int t = 0; t < NOT; t++) if (OTYPES[t].lvl <= lv) cand[n++] = t;
+  int t = cand[rand() % n]; if (n > 2 && rand() % 3 == 0) t = cand[n - 1 - rand() % 2];      // чаще - заказы своего уровня
+  o.type = t; o.client = rand() % 16; o.pay = OTYPES[t].pay * (90 + rand() % 25) / 100 / 100 * 100; o.live = true;
 }
-
-// ---------- сохранение ----------
-static void saveGame() {
-  FILE *f = fopen(pth("pcbuilder.sav"), "w"); if (!f) return;
-  fprintf(f, "1 %d %d %d %d %d\n", money, rep, day, paste, curOrder);
-  fprintf(f, "%d", (int)inv.size()); for (size_t i = 0; i < inv.size(); i++) fprintf(f, " %d", inv[i]); fprintf(f, "\n");
-  for (int i = 0; i < 3; i++) { Order &o = orders[i]; fprintf(f, "%d %d %d %d %d %d %d %d %d %d\n", o.type, o.budget, o.fps, o.cpu, o.ram, o.disk, o.game, o.client, o.rgb, o.active); }
-  for (int i = 0; i < NPT; i++) fprintf(f, "%d ", bd.part[i]); fprintf(f, "%d", bd.nram); for (int i = 0; i < 4; i++) fprintf(f, " %d", bd.ram[i]); fprintf(f, " %d %d %d\n", bd.paste, bd.cables, bd.closed);
-  fclose(f);
+static void newGame() {
+  memset(&S, 0, sizeof S); S.money = 40000; S.day = 1; S.soundOn = true; S.active = -1; S.tutorial = 1;
+  for (int i = 0; i < NPT; i++) S.slot[i] = -1;
+  for (int k = 0; k < NOFFER; k++) newOrder(S.offer[k]);
+  S.offer[0].type = OT_OFFICE; S.offer[0].pay = 28000;                                       // первый заказ - простой
 }
-static bool loadGame() {
-  FILE *f = fopen(pth("pcbuilder.sav"), "r"); if (!f) return false;
-  int ver = 0, n = 0; bool ok = fscanf(f, "%d %d %d %d %d %d", &ver, &money, &rep, &day, &paste, &curOrder) == 6;
-  if (ok && fscanf(f, "%d", &n) == 1) { inv.clear(); for (int i = 0; i < n; i++) { int v; if (fscanf(f, "%d", &v) == 1 && v >= 0 && v < NPART) inv.push_back(v); } }
-  for (int i = 0; i < 3 && ok; i++) { Order &o = orders[i]; int rgb = 0, act = 0; ok = fscanf(f, "%d %d %d %d %d %d %d %d %d %d", &o.type, &o.budget, &o.fps, &o.cpu, &o.ram, &o.disk, &o.game, &o.client, &rgb, &act) == 10; o.rgb = rgb; o.active = act; o.done = false; }
-  if (ok) { for (int i = 0; i < NPT; i++) if (fscanf(f, "%d", &bd.part[i]) != 1) ok = false; int p1 = 0, p2 = 0, p3 = 0; if (fscanf(f, "%d %d %d %d %d %d %d %d", &bd.nram, &bd.ram[0], &bd.ram[1], &bd.ram[2], &bd.ram[3], &p1, &p2, &p3) == 8) { bd.paste = p1; bd.cables = p2; bd.closed = p3; } else ok = false; }
-  fclose(f); level = levelOf(rep);
-  return ok;
+static const unsigned SAVE_MAGIC = 0x5B0B0001u;
+static unsigned sum32(const void *p, size_t n) { const unsigned char *b = (const unsigned char *)p; unsigned h = 2166136261u; for (size_t i = 0; i < n; i++) { h ^= b[i]; h *= 16777619u; } return h; }
+static bool writeTo(const char *fn) {
+  FILE *f = fopen(fn, "wb"); if (!f) return false; unsigned m = SAVE_MAGIC, cs = sum32(&S, sizeof S); int sz = (int)sizeof S;
+  bool ok = fwrite(&m, 4, 1, f) == 1 && fwrite(&sz, 4, 1, f) == 1 && fwrite(&S, sizeof S, 1, f) == 1 && fwrite(&cs, 4, 1, f) == 1;
+  ok = fflush(f) == 0 && ok; ok = fclose(f) == 0 && ok; return ok;
 }
-static void newGame() { money = 30000; rep = 0; day = 1; level = 1; paste = 3; inv.clear(); clearBuild(); curOrder = -1; for (int i = 0; i < 3; i++) genOrder(orders[i]); }
-
-// ---------- установка деталей с анимацией ----------
-struct Anim { int part; int slot; float t; };       // деталь летит со стола на место
-static std::vector<Anim> anims;
-static float powerT = 0; static bool powered = false;  // запуск при тесте: вентиляторы крутятся, подсветка
-static bool installPart(int ii) {
-  int pid = inv[ii]; const Part &p = PARTS[pid];
-  if (curOrder < 0) { say("СНАЧАЛА ВОЗЬМИ ЗАКАЗ"); return false; }
-  if (p.type != P_CASE && bd.part[P_CASE] < 0) { say("СНАЧАЛА ПОСТАВЬ КОРПУС"); return false; }
-  if ((p.type == P_CPU || p.type == P_RAM || p.type == P_COOLER || p.type == P_GPU || p.type == P_SSD) && bd.part[P_MB] < 0) { say("СНАЧАЛА ПОСТАВЬ ПЛАТУ"); return false; }
-  if (p.type == P_COOLER && bd.part[P_CPU] < 0) { say("СНАЧАЛА ПРОЦЕССОР"); return false; }
-  if (p.type == P_RAM) {
-    int slots = bd.part[P_MB] >= 0 ? PARTS[bd.part[P_MB]].c : 4;
-    if (bd.nram >= slots) { say("ВСЕ СЛОТЫ ПАМЯТИ ЗАНЯТЫ"); return false; }
-    bd.ram[bd.nram++] = pid;
-  } else {
-    if (bd.part[p.type] >= 0) { say("ЭТО МЕСТО УЖЕ ЗАНЯТО: СНАЧАЛА СНИМИ СТАРУЮ"); return false; }
-    bd.part[p.type] = pid;
-  }
-  inv.erase(inv.begin() + ii);
-  Anim a = {pid, p.type, 0}; anims.push_back(a);
-  tested = false; bd.closed = false; if (p.type != P_PSU) bd.cables = bd.cables && p.type != P_GPU && p.type != P_SSD && p.type != P_MB;
+static void saveGame() {                                         // надёжно: временный файл, потом подмена; старое - в запас
+  char tmp[600], sav[600], bak[600]; snprintf(tmp, sizeof tmp, "%s", pth("sborka.tmp")); snprintf(sav, sizeof sav, "%s", pth("sborka.sav")); snprintf(bak, sizeof bak, "%s", pth("sborka.bak"));
+  if (!writeTo(tmp)) { writeTo(sav); return; } remove(bak); rename(sav, bak); if (rename(tmp, sav) != 0) writeTo(sav);
+}
+static bool loadFrom(const char *fn) {
+  FILE *f = fopen(fn, "rb"); if (!f) return false; unsigned m = 0, cs = 0; int sz = 0; static Save t;
+  bool ok = fread(&m, 4, 1, f) == 1 && fread(&sz, 4, 1, f) == 1 && m == SAVE_MAGIC && sz == (int)sizeof t && fread(&t, sizeof t, 1, f) == 1 && fread(&cs, 4, 1, f) == 1 && cs == sum32(&t, sizeof t);
+  fclose(f); if (!ok) return false; S = t;
+  for (int i = 0; i < NPT; i++) if (S.slot[i] < -1 || S.slot[i] >= NPART) S.slot[i] = -1;
+  for (int i = 0; i < MAXPART; i++) S.inv[i] = clampi(S.inv[i], 0, 99);
+  if (S.active < -1 || S.active >= NOFFER) S.active = -1;
+  for (int k = 0; k < NOFFER; k++) if (S.offer[k].type < 0 || S.offer[k].type >= NOT) newOrder(S.offer[k]);
   return true;
 }
-static void removePart(int t) {                  // снять деталь обратно на склад (снимает и всё, что на ней стоит)
-  if (t == P_RAM) { if (bd.nram > 0) inv.push_back(bd.ram[--bd.nram]); }
-  else if (bd.part[t] >= 0) {
-    if (t == P_MB) { for (int k : {P_COOLER, P_CPU, P_GPU, P_SSD}) if (bd.part[k] >= 0) { inv.push_back(bd.part[k]); bd.part[k] = -1; } while (bd.nram) inv.push_back(bd.ram[--bd.nram]); bd.paste = false; }
-    if (t == P_CASE) { for (int k = 1; k < NPT; k++) if (k != P_RAM && bd.part[k] >= 0) { inv.push_back(bd.part[k]); bd.part[k] = -1; } while (bd.nram) inv.push_back(bd.ram[--bd.nram]); bd.paste = false; }
-    if (t == P_CPU) { if (bd.part[P_COOLER] >= 0) { inv.push_back(bd.part[P_COOLER]); bd.part[P_COOLER] = -1; } bd.paste = false; }
-    if (t == P_COOLER) bd.paste = false;
-    inv.push_back(bd.part[t]); bd.part[t] = -1;
-  }
-  bd.cables = false; bd.closed = false; tested = false;
-}
+static bool loadGame() { if (loadFrom(pth("sborka.sav"))) return true; if (loadFrom(pth("sborka.bak"))) return true; return loadFrom(pth("sborka.tmp")); }
 
-// ---------- 3D: стол, корпус, детали ----------
-static float camYaw = -2.0f, camPitch = 0.42f, camDist = 2.35f;
-static float caseH() { const Part *c = PT(P_CASE); return c && c->a ? 0.95f : 0.75f; }
-static float caseD() { const Part *c = PT(P_CASE); return c && c->a ? 0.45f : 0.38f; }
-static u32 rgbCol(float t) { return RGB((int)(128 + 127 * sinf(t)), (int)(128 + 127 * sinf(t + 2.1f)), (int)(128 + 127 * sinf(t + 4.2f))); }
-static u32 litRGB(float t) { return powered ? rgbCol(t) : RGB(70, 70, 80); }   // подсветка горит, когда ПК включён
-// кольцо из отрезков: axis 0 - плоскость YZ (смотрит вдоль X), 1 - плоскость XZ (смотрит вверх/вниз)
-static void ring(V3 c, float r, int axis, u32 col, float th) {
-  for (int i = 0; i < 12; i++) {
-    float a = i / 12.0f * 6.2832f, s = r * 0.27f;
-    if (axis == 2) drawBox(c + v3(cosf(a) * r, sinf(a) * r, 0), v3(s * fabsf(sinf(a)) + th, s * fabsf(cosf(a)) + th, th), 0, col, false);
-    else if (axis == 0) drawBox(c + v3(0, sinf(a) * r, cosf(a) * r), v3(th, s, th), 0, col, false);
-    else drawBox(c + v3(sinf(a) * r, 0, cosf(a) * r), v3(s, th, th), -a, col, false);
-  }
+// ---- проверка сборки ----
+static int SP(int t) { return S.slot[t]; }
+static const Part *PP(int t) { return S.slot[t] >= 0 ? &PARTS[S.slot[t]] : NULL; }
+static bool hasRgb() { return (PP(PT_CASE) && PP(PT_CASE)->b) || (PP(PT_COOL) && PP(PT_COOL)->b) || (PP(PT_RAM) && strstr(PP(PT_RAM)->name, "RGB")); }
+static int powerNeed() { int w = 60; if (PP(PT_CPU)) w += PP(PT_CPU)->c; if (PP(PT_GPU)) w += PP(PT_GPU)->c; return w; }
+static int buildScore() {
+  const Part *c = PP(PT_CPU), *g = PP(PT_GPU), *r = PP(PT_RAM), *s = PP(PT_SSD); if (!c) return 0;
+  int sc = c->b * 30 + (g ? g->b * 55 : 0) + (r ? r->c * 30 + (r->b == 5 ? 300 : 0) : 0) + (s ? s->c / 8 : 0);
+  return sc;
 }
-// вентилятор: рамка, кольцо подсветки, ступица и 7 лопастей
-static void fan(V3 c, float r, int axis, bool rgb) {
-  float sp = powered ? gTime * 22.0f : 0.4f; u32 fr = RGB(28, 28, 32), bl = RGB(55, 55, 62);
-  if (axis == 2) {                                         // смотрит вдоль Z: передние и задний вентиляторы, кулер-башня
-    drawBox(c + v3(0, r, 0), v3(r, 0.008f, 0.008f), 0, fr, true); drawBox(c - v3(0, r, 0), v3(r, 0.008f, 0.008f), 0, fr, true);
-    drawBox(c + v3(r, 0, 0), v3(0.008f, r, 0.008f), 0, fr, true); drawBox(c - v3(r, 0, 0), v3(0.008f, r, 0.008f), 0, fr, true);
-    if (rgb) ring(c, r * 0.9f, 2, litRGB(gTime * 2), 0.004f);
-    drawBox(c, v3(r * 0.22f, r * 0.22f, 0.006f), 0, RGB(35, 35, 40), true);
-    for (int k = 0; k < 7; k++) { float a = sp + k * 0.8976f; drawBox(c + v3(cosf(a) * r * 0.55f, sinf(a) * r * 0.55f, 0), v3(r * 0.13f + fabsf(sinf(a)) * r * 0.2f, r * 0.13f + fabsf(cosf(a)) * r * 0.2f, 0.002f), 0, bl, false); }
-    return;
-  }
-  if (axis == 0) {
-    drawBox(c + v3(0, r, 0), v3(0.008f, 0.008f, r), 0, fr, true); drawBox(c - v3(0, r, 0), v3(0.008f, 0.008f, r), 0, fr, true);
-    drawBox(c + v3(0, 0, r), v3(0.008f, r, 0.008f), 0, fr, true); drawBox(c - v3(0, 0, r), v3(0.008f, r, 0.008f), 0, fr, true);
-    if (rgb) ring(c - v3(0.006f, 0, 0), r * 0.9f, 0, litRGB(gTime * 2), 0.004f);
-    drawBox(c - v3(0.004f, 0, 0), v3(0.006f, r * 0.22f, r * 0.22f), 0, RGB(35, 35, 40), true);
-    for (int k = 0; k < 7; k++) { float a = sp + k * 0.8976f; drawBox(c + v3(-0.004f, sinf(a) * r * 0.55f, cosf(a) * r * 0.55f), v3(0.002f, r * 0.13f + fabsf(cosf(a)) * r * 0.2f, r * 0.13f + fabsf(sinf(a)) * r * 0.2f), 0, bl, false); }
-  } else {
-    drawBox(c + v3(r, 0, 0), v3(0.008f, 0.008f, r), 0, fr, true); drawBox(c - v3(r, 0, 0), v3(0.008f, 0.008f, r), 0, fr, true);
-    drawBox(c + v3(0, 0, r), v3(r, 0.008f, 0.008f), 0, fr, true); drawBox(c - v3(0, 0, r), v3(r, 0.008f, 0.008f), 0, fr, true);
-    if (rgb) ring(c - v3(0, 0.006f, 0), r * 0.9f, 1, litRGB(gTime * 2), 0.004f);
-    drawBox(c - v3(0, 0.004f, 0), v3(r * 0.22f, 0.006f, r * 0.22f), 0, RGB(35, 35, 40), true);
-    for (int k = 0; k < 7; k++) { float a = sp + k * 0.8976f; drawBox(c + v3(sinf(a) * r * 0.55f, -0.004f, cosf(a) * r * 0.55f), v3(r * 0.32f, 0.002f, r * 0.12f), a, bl, false); }
-  }
+static float cpuTemp() {
+  const Part *c = PP(PT_CPU), *k = PP(PT_COOL), *cs = PP(PT_CASE); if (!c || !k) return 120;
+  float air = cs ? cs->a / 100.0f : 1.0f; return 32.0f + 62.0f * c->c / (k->c * air);
 }
-static V3 slotPos(int t, int idx) {
-  float H = caseH(), D = caseD();
-  switch (t) {
-    case P_CASE: return v3(0, H * 0.5f, 0);
-    case P_MB: return v3(0.195f, H * 0.5f + 0.06f, -D * 0.25f);
-    case P_CPU: return v3(0.188f, H - 0.24f, -0.1f);
-    case P_COOLER: return v3(0.12f, H - 0.24f, -0.1f);
-    case P_RAM: return v3(0.175f, H - 0.24f, 0.01f + idx * 0.022f);
-    case P_GPU: return v3(0.13f, H * 0.42f, -D + 0.05f + 0.15f);
-    case P_PSU: return v3(0.0f, 0.085f, D - 0.13f);
-    default: return v3(0.188f, H * 0.32f, -0.02f);
-  }
-}
-static void drawPart(int pid, V3 c, float k) {
-  const Part &p = PARTS[pid]; float H = caseH(), D = caseD(); (void)k;
+static int buildCost() { int s = 0; for (int t = 0; t < NPT; t++) if (S.slot[t] >= 0) s += PARTS[S.slot[t]].price; return s; }
+// можно ли сейчас поставить деталь; если нет - причина
+static bool canInstall(int pi, char *why, int n) {
+  const Part &p = PARTS[pi]; why[0] = 0;
+  if (S.slot[p.type] >= 0) { snprintf(why, n, "%s УЖЕ СТОИТ", PTN[p.type]); return false; }
+  const Part *cs = PP(PT_CASE), *mb = PP(PT_MB);
   switch (p.type) {
-    case P_CASE: break;
-    case P_MB: {                                                            // материнская плата: текстолит, радиаторы, слоты, разъёмы
-      float hh = H * 0.38f, hz = D * 0.6f; u32 pcb = p.b == 5 ? RGB(24, 28, 40) : RGB(22, 54, 34);
-      drawBox(c, v3(0.004f, hh, hz), 0, pcb, true);
-      for (int i = 0; i < 7; i++) drawBox(c + v3(-0.005f, -hh + 0.05f + i * hh * 0.28f, -hz * 0.2f), v3(0.0005f, 0.002f, hz * 0.6f), 0, mixc(pcb, RGB(200, 180, 90), 0.25f), false);   // дорожки
-      V3 sock = slotPos(P_CPU, 0);
-      drawBox(v3(c.x - 0.006f, sock.y, sock.z), v3(0.003f, 0.045f, 0.045f), 0, RGB(150, 150, 160), true);                   // рамка сокета
-      drawBox(v3(c.x - 0.012f, sock.y + 0.075f, sock.z - 0.01f), v3(0.01f, 0.018f, 0.06f), 0, RGB(70, 72, 80), true);       // радиаторы питания
-      drawBox(v3(c.x - 0.012f, sock.y, sock.z - 0.075f), v3(0.01f, 0.06f, 0.016f), 0, RGB(70, 72, 80), true);
-      drawBox(v3(c.x - 0.013f, sock.y + 0.05f, sock.z - 0.115f), v3(0.012f, 0.05f, 0.02f), 0, RGB(40, 42, 48), true);       // кожух разъёмов
-      drawBox(v3(c.x - 0.026f, sock.y + 0.05f, sock.z - 0.135f), v3(0.001f, 0.045f, 0.003f), 0, litRGB(gTime * 2 + 1), false);   // подсветка на кожухе
-      for (int i = 0; i < p.c; i++) drawBox(v3(c.x - 0.006f, H - 0.24f, 0.01f + i * 0.022f), v3(0.004f, 0.068f, 0.003f), 0, RGB(30, 30, 34), true);   // слоты памяти
-      for (int i = 0; i < 3; i++) drawBox(v3(c.x - 0.006f, H * 0.42f - 0.035f - i * 0.065f, -D + 0.25f), v3(0.004f, 0.004f, 0.09f), 0, i ? RGB(30, 30, 34) : RGB(170, 170, 180), true);   // слоты PCIe
-      drawBox(v3(c.x - 0.01f, H * 0.32f - 0.05f, 0.02f), v3(0.008f, 0.025f, 0.03f), 0, RGB(60, 62, 70), true);              // радиатор чипсета
-      drawBox(v3(c.x - 0.006f, H - 0.24f, 0.11f), v3(0.006f, 0.04f, 0.008f), 0, RGB(220, 220, 225), true);                  // 24-пин
-      for (int i = 0; i < 5; i++) drawBox(v3(c.x - 0.009f, sock.y + 0.035f - i * 0.015f, sock.z + 0.06f), v3(0.006f, 0.005f, 0.005f), 0, RGB(40, 40, 46), true);   // конденсаторы
-    } break;
-    case P_CPU:
-      drawBox(c, v3(0.004f, 0.032f, 0.032f), 0, RGB(40, 90, 50), true);                                     // подложка
-      drawBox(c - v3(0.004f, 0, 0), v3(0.002f, 0.026f, 0.026f), 0, RGB(205, 205, 212), true);               // крышка
-      if (bd.paste && k >= 1) drawBox(c - v3(0.007f, 0, 0), v3(0.001f, 0.014f, 0.014f), 0, RGB(185, 185, 190), false);
-      break;
-    case P_COOLER:
-      if (p.a >= 250) {                                                    // водянка: помпа с подсветкой, шланги, радиатор с тремя вентиляторами
-        drawBox(c + v3(0.045f, 0, 0), v3(0.022f, 0.032f, 0.032f), 0, RGB(30, 30, 34), true);
-        ring(c + v3(0.02f, 0, 0), 0.024f, 0, litRGB(gTime * 2), 0.004f);
-        for (int i = -1; i <= 1; i += 2) drawBox(v3(0.03f, (c.y + H - 0.05f) * 0.5f, c.z + i * 0.02f), v3(0.008f, (H - 0.05f - c.y) * 0.5f, 0.008f), 0, RGB(25, 25, 28), true);
-        drawBox(v3(0.0f, H - 0.035f, -0.05f), v3(0.14f, 0.015f, 0.21f), 0, RGB(30, 30, 34), true);
-        for (int i = -1; i <= 1; i++) fan(v3(0.0f, H - 0.062f, -0.05f + i * 0.135f), 0.06f, 1, true);
-      } else {
-        float s = p.a >= 130 ? 1.0f : 0.6f;
-        if (p.a < 130) { drawBox(c + v3(-0.02f, 0, 0), v3(0.02f, 0.045f, 0.045f), 0, RGB(150, 150, 158), true); fan(c + v3(-0.045f, 0, 0), 0.04f, 0, false); }   // коробочный
-        else {                                                             // башня: медные трубки, рёбра, вентилятор
-          for (int i = -1; i <= 1; i++) drawBox(c + v3(0.04f, 0.02f, i * 0.02f), v3(0.006f, 0.05f, 0.005f), 0, RGB(200, 120, 70), true);
-          for (int i = 0; i < 12; i++) drawBox(c + v3(-0.01f, -0.06f + i * 0.012f, 0), v3(0.05f, 0.0025f, 0.06f), 0, RGB(190, 192, 200), true);
-          drawBox(c + v3(-0.01f, 0.085f, 0), v3(0.052f, 0.006f, 0.062f), 0, p.b ? RGB(30, 30, 34) : RGB(170, 172, 180), true);
-          if (p.b) drawBox(c + v3(-0.01f, 0.092f, 0), v3(0.04f, 0.002f, 0.05f), 0, litRGB(gTime * 2), false);
-          fan(c + v3(-0.01f, 0, -0.07f * s), 0.06f * s, 2, p.b);
-        }
-      }
-      break;
-    case P_RAM:
-      drawBox(c, v3(0.016f, 0.066f, 0.004f), 0, p.a == 5 ? RGB(38, 38, 46) : RGB(26, 80, 44), true);
-      for (int i = 0; i < 4; i++) drawBox(c + v3(-0.0165f, -0.045f + i * 0.03f, 0), v3(0.001f, 0.008f, 0.0045f), 0, p.a == 5 ? RGB(80, 80, 92) : RGB(60, 120, 80), false);   // рёбра радиатора
-      if (p.a == 5) drawBox(c + v3(-0.017f, 0, 0) + v3(0.0f, 0.0f, 0.0f) + v3(0, 0.0f, 0), v3(0.002f, 0.06f, 0.0015f), 0, litRGB(gTime * 3 + c.z * 40), false);   // RGB-полоска
-      break;
-    case P_GPU: {                                                           // видеокарта: кожух с гранями, бэкплейт, вентиляторы, логотип
-      float L = p.c / 1000.0f, z0 = c.z - 0.15f; u32 sh = p.a >= 100 ? RGB(40, 40, 46) : RGB(30, 32, 38);
-      drawBox(v3(c.x, c.y, z0 + L * 0.5f), v3(0.065f, 0.026f, L * 0.5f), 0, sh, true);
-      drawBox(v3(c.x, c.y + 0.028f, z0 + L * 0.5f), v3(0.064f, 0.003f, L * 0.5f), 0, RGB(70, 72, 80), true);   // бэкплейт
-      drawBox(v3(c.x - 0.066f, c.y, z0 + L * 0.5f), v3(0.002f, 0.024f, L * 0.48f), 0, RGB(90, 92, 100), true); // торец
-      drawBox(v3(c.x - 0.068f, c.y + 0.005f, z0 + L * 0.3f), v3(0.001f, 0.006f, L * 0.18f), 0, litRGB(gTime * 2), false);   // светящийся логотип
-      int nf = p.c >= 270 ? 3 : (p.c >= 220 ? 2 : 1); float fr = fminv(0.048f, L / nf * 0.42f);
-      for (int i = 0; i < nf; i++) fan(v3(c.x, c.y - 0.03f, z0 + L * (i + 0.5f) / nf), fr, 1, p.a >= 100);
-      drawBox(v3(c.x + 0.06f, c.y, z0 - 0.004f), v3(0.006f, 0.034f, 0.004f), 0, RGB(185, 185, 195), true);   // планка с выходами
-      if (p.b >= 170) drawBox(v3(c.x - 0.02f, c.y + 0.034f, z0 + L * 0.75f), v3(0.012f, 0.006f, 0.01f), 0, RGB(30, 30, 30), true);   // разъём питания
-    } break;
-    case P_PSU:
-      drawBox(c, v3(0.15f, 0.07f, 0.09f), 0, RGB(30, 30, 34), true);
-      for (int i = 0; i < 6; i++) drawBox(c + v3(-0.151f, -0.04f + i * 0.016f, 0), v3(0.001f, 0.003f, 0.07f), 0, RGB(60, 60, 66), false);   // решётка
-      drawBox(c + v3(-0.152f, 0.045f, 0.0f), v3(0.001f, 0.012f, 0.04f), 0, RGB(220, 180, 40), false);          // наклейка
-      fan(c + v3(0, -0.072f, 0), 0.055f, 1, false);
-      break;
-    case P_SSD:
-      if (p.b == 2) { drawBox(c, v3(0.004f, 0.012f, 0.04f), 0, RGB(25, 25, 28), true); drawBox(c - v3(0.005f, 0, 0), v3(0.002f, 0.013f, 0.038f), 0, RGB(80, 82, 90), true); }   // NVMe под радиатором
-      else if (p.b == 1) { drawBox(c + v3(-0.05f, -0.12f, -0.1f), v3(0.035f, 0.005f, 0.05f), 0, RGB(40, 40, 46), true); drawBox(c + v3(-0.05f, -0.114f, -0.1f), v3(0.025f, 0.001f, 0.03f), 0, RGB(220, 60, 60), false); }
-      else { drawBox(v3(-0.05f, 0.06f, -D + 0.1f), v3(0.05f, 0.015f, 0.07f), 0, RGB(150, 152, 160), true); drawBox(v3(-0.05f, 0.076f, -D + 0.1f), v3(0.035f, 0.001f, 0.04f), 0, RGB(240, 240, 240), false); }
-      break;
+    case PT_CASE: return true;
+    case PT_MB: if (!cs) { snprintf(why, n, "СНАЧАЛА ПОСТАВЬ КОРПУС"); return false; } if (cs->c == 1 && p.c == 0) { snprintf(why, n, "ПЛАТА ATX НЕ ЛЕЗЕТ В МИНИ-КОРПУС"); return false; } return true;
+    case PT_PSU: if (!cs) { snprintf(why, n, "СНАЧАЛА ПОСТАВЬ КОРПУС"); return false; } return true;
+    case PT_CPU: if (!mb) { snprintf(why, n, "СНАЧАЛА ПОСТАВЬ ПЛАТУ"); return false; } if (mb->a != p.a) { snprintf(why, n, "НЕ ТОТ СОКЕТ: ПЛАТА %s, ПРОЦЕССОР %s", mb->a ? "Б" : "А", p.a ? "Б" : "А"); return false; } return true;
+    case PT_COOL: if (!PP(PT_CPU)) { snprintf(why, n, "СНАЧАЛА ПОСТАВЬ ПРОЦЕССОР"); return false; } return true;
+    case PT_RAM: if (!mb) { snprintf(why, n, "СНАЧАЛА ПОСТАВЬ ПЛАТУ"); return false; } if (mb->b != p.b) { snprintf(why, n, "ПЛАТА ПОД DDR%d, А ПАМЯТЬ DDR%d", mb->b, p.b); return false; } return true;
+    case PT_SSD: if (!mb) { snprintf(why, n, "СНАЧАЛА ПОСТАВЬ ПЛАТУ"); return false; } return true;
+    case PT_GPU: if (!mb) { snprintf(why, n, "СНАЧАЛА ПОСТАВЬ ПЛАТУ"); return false; } if (cs && p.d > cs->d) { snprintf(why, n, "ВИДЕОКАРТА %d ММ, А В КОРПУС ВЛЕЗАЕТ %d", p.d, cs->d); return false; } return true;
   }
+  return true;
 }
-static void drawScene() {
-  // комната: пол, стена, стол с ковриком, клавиатурой, мышкой, лампой
-  groundQuad(-4, -4, 4, 4, -0.76f, RGB(110, 92, 80));
-  drawBox(v3(1.6f, 0.4f, 0.0f), v3(0.02f, 1.2f, 2.0f), 0, RGB(70, 74, 90), true);
-  drawBox(v3(1.57f, 0.55f, 0.0f), v3(0.004f, 0.01f, 1.9f), 0, litRGB(gTime * 0.5f), false);           // LED-лента на стене
-  drawBox(v3(0, -0.04f, 0), v3(1.1f, 0.04f, 0.75f), 0, RGB(52, 44, 40), true);
-  drawBox(v3(0, -0.002f, 0), v3(1.1f, 0.002f, 0.75f), 0, RGB(64, 54, 48), false);
-  for (int i = -1; i <= 1; i += 2) for (int j = -1; j <= 1; j += 2) drawBox(v3(i * 1.0f, -0.42f, j * 0.65f), v3(0.04f, 0.36f, 0.04f), 0, RGB(30, 30, 34), true);
-  drawBox(v3(0.15f, 0.002f, 0.3f), v3(0.28f, 0.002f, 0.4f), 0, RGB(25, 25, 30), true);                  // коврик
-  drawBox(v3(0.15f, 0.012f, 0.32f), v3(0.08f, 0.008f, 0.26f), 0, RGB(35, 35, 40), true);                // клавиатура
-  for (int r = 0; r < 4; r++) drawBox(v3(0.1f + r * 0.03f, 0.021f, 0.32f), v3(0.01f, 0.002f, 0.24f), 0, litRGB(gTime * 1.5f + r), false);
-  drawBox(v3(0.2f, 0.012f, 0.65f), v3(0.035f, 0.01f, 0.022f), 0.2f, RGB(30, 30, 34), true);              // мышь
-  // монитор на подставке
-  drawBox(v3(0.55f, 0.008f, 0.35f), v3(0.1f, 0.008f, 0.08f), 0, RGB(40, 40, 46), true);
-  drawBox(v3(0.6f, 0.13f, 0.35f), v3(0.015f, 0.12f, 0.02f), 0, RGB(40, 40, 46), true);
-  drawBox(v3(0.56f, 0.34f, 0.35f), v3(0.012f, 0.2f, 0.34f), 0, RGB(20, 20, 24), true);
-  bool scrOn = powered && powerT > 1.0f;
-  drawBox(v3(0.546f, 0.34f, 0.35f), v3(0.002f, 0.185f, 0.32f), 0, scrOn ? RGB(40, 110, 200) : RGB(8, 10, 14), false);
-  if (scrOn) for (int i = 0; i < 4; i++) drawBox(v3(0.544f, 0.42f - i * 0.05f, 0.25f + (i % 2) * 0.05f), v3(0.001f, 0.012f, 0.12f + i * 0.03f), 0, RGB(200, 230, 255), false);
-  // коробки со склада
-  for (int i = 0; i < imin(8, (int)inv.size()); i++) { V3 bp = v3(-0.75f + (i % 4) * 0.13f, 0.03f + (i / 4) * 0.06f, -0.55f);
-    drawBox(bp, v3(0.055f, 0.03f, 0.05f), i * 0.3f, RGB(175, 135, 85), true); drawBox(bp + v3(0, 0.031f, 0), v3(0.056f, 0.001f, 0.012f), i * 0.3f, RGB(200, 170, 120), false); }
-  // корпус
-  const Part *cs = PT(P_CASE);
-  bool flying = false; for (size_t i = 0; i < anims.size(); i++) if (anims[i].slot == P_CASE) flying = true;
-  if (cs && !flying) {
-    float H = caseH(), D = caseD(); bool white = cs->c == 2;
-    u32 cc = cs->c == 0 ? RGB(56, 58, 66) : cs->c == 1 ? RGB(26, 26, 30) : cs->c == 2 ? RGB(232, 232, 238) : RGB(16, 16, 20);
-    u32 in = white ? RGB(215, 215, 222) : mixc(cc, RGB(0, 0, 0), 0.25f);
-    for (int i = -1; i <= 1; i += 2) for (int j = -1; j <= 1; j += 2) drawBox(v3(i * 0.17f, -0.006f, j * (D - 0.05f)), v3(0.03f, 0.006f, 0.03f), 0, RGB(20, 20, 22), true);   // ножки
-    drawBox(v3(0.217f, H * 0.5f, 0), v3(0.006f, H * 0.5f, D), 0, in, true);                       // стенка под плату
-    for (int i = 0; i < 3; i++) drawBox(v3(0.21f, H * (0.3f + i * 0.2f), D * 0.55f), v3(0.001f, 0.035f, 0.02f), 0, RGB(15, 15, 18), false);   // отверстия для проводов
-    drawBox(v3(0, H - 0.008f, 0), v3(0.222f, 0.008f, D), 0, cc, true);                            // верх с сеткой
-    for (int i = 0; i < 6; i++) drawBox(v3(0, H + 0.0005f, -D * 0.6f + i * D * 0.24f), v3(0.18f, 0.001f, 0.012f), 0, mixc(cc, RGB(0, 0, 0), 0.4f), false);
-    drawBox(v3(0, 0.008f, 0), v3(0.222f, 0.008f, D), 0, cc, true);
-    drawBox(v3(0, H * 0.5f, -D - 0.012f), v3(0.222f, H * 0.5f, 0.016f), 0, cc, true);             // перед
-    for (int i = 0; i < 9; i++) drawBox(v3(0, 0.12f + i * (H - 0.2f) / 9, -D - 0.029f), v3(0.15f, 0.004f, 0.001f), 0, mixc(cc, RGB(0, 0, 0), 0.35f), false);   // сетка спереди
-    drawBox(v3(-0.18f, H - 0.06f, -D - 0.03f), v3(0.012f, 0.012f, 0.002f), 0, powered ? RGB(80, 200, 255) : RGB(90, 90, 100), false);   // кнопка включения
-    if (cs->d) { drawBox(v3(0.0f, 0.05f, -D - 0.03f), v3(0.2f, 0.003f, 0.001f), 0, litRGB(gTime * 2), false); for (int i = 0; i < 2; i++) fan(v3(0.0f, H * (0.35f + i * 0.3f), -D + 0.03f), 0.07f, 2, true); }
-    drawBox(v3(0, H * 0.5f, D), v3(0.222f, H * 0.5f, 0.008f), 0, cc, true);                        // зад
-    for (int i = 0; i < 4; i++) drawBox(v3(0.12f, H * 0.42f - 0.035f - i * 0.065f, D + 0.009f), v3(0.006f, 0.02f, 0.001f), 0, RGB(150, 150, 160), false);   // заглушки слотов
-    fan(v3(0.05f, H * 0.68f, D - 0.03f), 0.06f, 2, cs->d);
-    // кожух блока питания (подвал)
-    if (cs->a) { drawBox(v3(0, 0.165f, D * 0.25f), v3(0.215f, 0.004f, D * 0.75f), 0, in, true); drawBox(v3(-0.2f, 0.09f, D * 0.25f), v3(0.004f, 0.075f, D * 0.75f), 0, in, true);
-      drawBox(v3(-0.205f, 0.09f, D * 0.25f), v3(0.001f, 0.02f, 0.08f), 0, litRGB(gTime * 2 + 3), false); }
-    if (bd.closed) {                                                                               // боковая крышка: у стеклянного - тонированное стекло и рамка
-      if (cs->d) { for (int i = -1; i <= 1; i += 2) { drawBox(v3(-0.224f, H * 0.5f, i * (D - 0.008f)), v3(0.004f, H * 0.5f, 0.01f), 0, cc, true); drawBox(v3(-0.224f, i > 0 ? H - 0.008f : 0.008f, 0), v3(0.004f, 0.008f, D), 0, cc, true); }
-        for (int i = 0; i < 3; i++) drawBox(v3(-0.226f, H * (0.3f + i * 0.25f), -D * 0.3f + i * 0.1f), v3(0.0005f, 0.004f, D * 0.25f), -0.6f, RGB(150, 160, 175), false); }   // блики на стекле
-      else drawBox(v3(-0.224f, H * 0.5f, 0), v3(0.004f, H * 0.5f, D), 0, cc, true);
-    }
-    for (int t = P_MB; t < NPT; t++) {
-      if (t == P_RAM) { for (int i = 0; i < bd.nram; i++) { bool fl = false; for (auto &a : anims) if (a.slot == P_RAM && a.part == bd.ram[i] && i == bd.nram - 1) fl = true; if (!fl) drawPart(bd.ram[i], slotPos(P_RAM, i), 1); } continue; }
-      if (bd.part[t] < 0) continue;
-      bool fl = false; for (auto &a : anims) if (a.slot == t) fl = true;
-      if (!fl) drawPart(bd.part[t], slotPos(t, 0), 1);
-    }
-    if (bd.cables) {                                                                               // аккуратные провода в оплётке
-      u32 cw = white ? RGB(235, 235, 240) : RGB(28, 28, 32);
-      V3 pin24 = v3(0.2f, H - 0.24f, 0.11f);
-      drawBox(v3(0.205f, (pin24.y + 0.17f) * 0.5f, D * 0.55f), v3(0.006f, (pin24.y - 0.17f) * 0.5f, 0.02f), 0, cw, false);
-      drawBox(v3(0.2f, pin24.y, (pin24.z + D * 0.55f) * 0.5f), v3(0.008f, 0.02f, (D * 0.55f - pin24.z) * 0.5f), 0, cw, false);
-      drawBox(v3(0.205f, H - 0.06f, -0.15f), v3(0.006f, 0.008f, 0.05f), 0, cw, false);            // питание процессора сверху
-      if (bd.part[P_GPU] >= 0 && PARTS[bd.part[P_GPU]].b >= 170) drawBox(v3(0.11f, (H * 0.42f + 0.17f) * 0.5f + 0.02f, -D + 0.05f + 0.15f + PARTS[bd.part[P_GPU]].c / 1000.0f * 0.75f - 0.15f), v3(0.006f, (H * 0.42f - 0.17f) * 0.5f, 0.006f), 0, cw, false);
-    }
-  }
-  // летящие детали
-  for (size_t i = 0; i < anims.size(); i++) {
-    const Anim &a = anims[i]; float kk = fminv(1.0f, a.t / 0.6f), e = kk * kk * (3 - 2 * kk);
-    V3 from = v3(-0.7f, 0.15f, -0.55f), to = slotPos(a.slot, a.slot == P_RAM ? bd.nram - 1 : 0);
-    V3 pnt = from + (to - from) * e + v3(0, sinf(e * 3.14159f) * 0.25f, 0);
-    if (a.slot == P_CASE) { float H = caseH(), D = caseD(); drawBox(pnt, v3(0.22f, H * 0.5f, D), e * 6.28f, RGB(56, 58, 66), true); }
-    else drawPart(a.part, pnt, kk);
-  }
+// что зависит от детали: снимаем вместе с ней
+static void uninstall(int t) {
+  if (S.slot[t] < 0) return;
+  if (t == PT_CASE) { for (int k = 0; k < NPT; k++) if (k != PT_CASE) uninstall(k); }
+  if (t == PT_MB) { uninstall(PT_CPU); uninstall(PT_RAM); uninstall(PT_SSD); uninstall(PT_GPU); S.cab[0] = 0; }
+  if (t == PT_CPU) { uninstall(PT_COOL); S.cab[1] = 0; }
+  if (t == PT_GPU) S.cab[2] = 0;
+  if (t == PT_PSU) { S.cab[0] = S.cab[1] = S.cab[2] = 0; }
+  S.inv[S.slot[t]]++; S.slot[t] = -1;
 }
-static bool scr(V3 p, int &x, int &y) { V3 v = toView(p); if (v.z < 0.05f) return false; x = (int)(vcx + v.x * focal / v.z); y = (int)(vcy - v.y * focal / v.z); return true; }
-
-// ---------- интерфейс ----------
-static int tab = 0, shopCat = P_CPU, page = 0;
-static float testT = -1; static bool testBoots = false;
-static void fmtR(char *b, int n, int v) { char t[32]; snprintf(t, sizeof t, "%d", v < 0 ? -v : v); int L = (int)strlen(t), k = 0; char o[48]; if (v < 0) o[k++] = '-'; for (int i = 0; i < L; i++) { o[k++] = t[i]; if ((L - i - 1) % 3 == 0 && i < L - 1) o[k++] = ' '; } o[k] = 0; snprintf(b, n, "%s Р", o); }
-struct ReqLine { char text[96]; bool ok; };
-static int orderReqs(const Order &o, ReqLine *r) {
-  int n = 0; char v[32];
-  if (o.fps) { snprintf(r[n].text, 96, "FPS В \"%s\" ОТ %d (СЕЙЧАС ~%d)", GAMES[o.game], o.fps, estFps(o.game)); r[n].ok = estFps(o.game) >= o.fps; n++; }
-  if (o.cpu) { snprintf(r[n].text, 96, "МОЩНОСТЬ ПРОЦЕССОРА ОТ %d (СЕЙЧАС %d)", o.cpu, (int)cpuScore()); r[n].ok = cpuScore() >= o.cpu; n++; }
-  snprintf(r[n].text, 96, "ПАМЯТЬ ОТ %d ГБ (СЕЙЧАС %d)", o.ram, ramGB()); r[n].ok = ramGB() >= o.ram; n++;
-  snprintf(r[n].text, 96, "ДИСК ОТ %d ГБ (СЕЙЧАС %d)", o.disk, PT(P_SSD) ? PT(P_SSD)->a : 0); r[n].ok = PT(P_SSD) && PT(P_SSD)->a >= o.disk; n++;
-  if (o.rgb) { snprintf(r[n].text, 96, "ХОЧЕТ ПОДСВЕТКУ RGB"); r[n].ok = hasRgb(); n++; }
-  fmtR(v, sizeof v, buildCost()); char bb[32]; fmtR(bb, sizeof bb, o.budget);
-  snprintf(r[n].text, 96, "ДЕТАЛИ: %s ИЗ БЮДЖЕТА %s", v, bb); r[n].ok = buildCost() <= o.budget; n++;
+// требования заказа: сколько выполнено, строки для показа
+struct Req { char text[64]; bool ok; };
+static int orderReqs(const Order &o, Req *r, int score, bool tested) {
+  const OrderType &t = OTYPES[o.type]; int n = 0; char b[64];
+  snprintf(r[n].text, 64, "ОЦЕНКА НЕ МЕНЬШЕ %d", t.minScore); r[n++].ok = tested && score >= t.minScore;
+  if (t.needGpu) { snprintf(r[n].text, 64, "ЕСТЬ ВИДЕОКАРТА"); r[n++].ok = PP(PT_GPU) != NULL; }
+  snprintf(r[n].text, 64, "ПАМЯТЬ ОТ %d ГБ", t.minRam); r[n++].ok = PP(PT_RAM) && PP(PT_RAM)->c >= t.minRam;
+  if (t.minSsd >= 1024) snprintf(b, sizeof b, "SSD ОТ %d ТБ", t.minSsd / 1024); else snprintf(b, sizeof b, "SSD ОТ %d ГБ", t.minSsd); snprintf(r[n].text, 64, "%s", b); r[n++].ok = PP(PT_SSD) && PP(PT_SSD)->c >= t.minSsd;
+  if (t.mini) { snprintf(r[n].text, 64, "МАЛЕНЬКИЙ КОРПУС"); r[n++].ok = PP(PT_CASE) && PP(PT_CASE)->c == 1; }
+  if (t.rgb) { snprintf(r[n].text, 64, "С ПОДСВЕТКОЙ RGB"); r[n++].ok = hasRgb(); }
+  if (t.minCpu) { snprintf(r[n].text, 64, "ПРОЦЕССОР МОЩНОСТЬЮ ОТ %d", t.minCpu); r[n++].ok = PP(PT_CPU) && PP(PT_CPU)->b >= t.minCpu; }
   return n;
 }
-static void deliver() {
-  if (curOrder < 0) return;
-  Order &o = orders[curOrder]; ReqLine r[8]; int n = orderReqs(o, r); int miss = 0; for (int i = 0; i < n - 1; i++) if (!r[i].ok) miss++;
-  int cost = buildCost(); char b[128], m[32];
-  if (miss == 0) {
-    int tip = (o.fps && estFps(o.game) >= o.fps * 13 / 10) ? o.budget / 20 : 0;
-    money += o.budget + tip; rep += (cost <= o.budget * 85 / 100) ? 2 : 1;
-    fmtR(m, sizeof m, o.budget - cost + tip); snprintf(b, sizeof b, "%s ДОВОЛЕН! ПРИБЫЛЬ %s%s", CNAMES[o.client], m, tip ? " (С ЧАЕВЫМИ)" : "");
-  } else {
-    int pay = o.budget * 6 / 10; money += pay; rep = imax(0, rep - 1);
-    fmtR(m, sizeof m, pay - cost); snprintf(b, sizeof b, "НЕ ВСЁ КАК ПРОСИЛИ: ЗАПЛАТИЛИ 60%%, ИТОГ %s", m);
-  }
-  say(b);
-  int oldL = level; level = levelOf(rep); if (level > oldL) { char lb[96]; snprintf(lb, sizeof lb, "НОВЫЙ УРОВЕНЬ %d: В МАГАЗИНЕ НОВЫЕ ДЕТАЛИ!", level); say(lb); }
-  clearBuild(); anims.clear(); powered = false; genOrder(orders[curOrder]); curOrder = -1; day++; saveGame();
+
+// =====================================================================
+//  СБОРКА ПК: 3D - корпус, детали, провода, вентиляторы
+// =====================================================================
+// 1 единица = 100 мм. Корпус стоит на столе, открытая боковая стенка смотрит на +X.
+static float fanSpin = 0, fanSpeed = 3.0f;          // вращение вентиляторов (на тесте - быстрее)
+static float partAnim[NPT];                          // 0..1 - деталь «влетает» на место
+static float cabAnim[3];
+static bool gPowerOn = false;                        // ПК включён: светятся вентиляторы и подсветка
+static V3 OFF;                                       // смещение текущей детали (анимация установки)
+static void BXo(float x, float y, float z, float hx, float hy, float hz, u32 col) { drawBox(v3(x + OFF.x, y + OFF.y, z + OFF.z), v3(hx, hy, hz), 0, col, true); }
+static void BXe(float x, float y, float z, float hx, float hy, float hz, u32 col) { drawBox(v3(x + OFF.x, y + OFF.y, z + OFF.z), v3(hx, hy, hz), 0, col, false); }   // светится - без тени
+static u32 rgbCycle(float ph) { float t = gTime * 0.8f + ph; return RGB((int)(127 + 127 * sinf(t)), (int)(127 + 127 * sinf(t + 2.094f)), (int)(127 + 127 * sinf(t + 4.189f))); }
+static float easeOut(float t) { t = clampf(t, 0, 1); return 1 - (1 - t) * (1 - t) * (1 - t); }
+static void setOff(float a) { float k = 1 - easeOut(a); OFF = v3(3.5f * k, 1.6f * k, 0.6f * k); }
+// вентилятор: рамка и 4 лопасти, крутятся (ось 0 - X, 1 - Y, 2 - Z)
+static void drawFan(float x, float y, float z, int axis, float r, u32 frame, u32 blade, bool glow, float ph) {
+  float t = 0.03f, ang = fanSpin + ph;
+  if (axis == 0) { BXo(x, y + r, z, t, t, r, frame); BXo(x, y - r, z, t, t, r, frame); BXo(x, y, z + r, t, r, t, frame); BXo(x, y, z - r, t, r, t, frame); }
+  if (axis == 1) { BXo(x + r, y, z, t, t, r, frame); BXo(x - r, y, z, t, t, r, frame); BXo(x, y, z + r, r, t, t, frame); BXo(x, y, z - r, r, t, t, frame); }
+  if (axis == 2) { BXo(x, y + r, z, r, t, t, frame); BXo(x, y - r, z, r, t, t, frame); BXo(x + r, y, z, t, r, t, frame); BXo(x - r, y, z, t, r, t, frame); }
+  for (int k = 0; k < 4; k++) { float a = ang + k * 1.5708f, ca = cosf(a) * r * 0.5f, sa = sinf(a) * r * 0.5f, b = r * 0.22f;
+    if (axis == 0) BXo(x, y + ca, z + sa, 0.015f, b, b, blade);
+    if (axis == 1) BXo(x + ca, y, z + sa, b, 0.015f, b, blade);
+    if (axis == 2) BXo(x + ca, y + sa, z, b, b, 0.015f, blade); }
+  float hb = r * 0.18f; if (axis == 0) BXo(x, y, z, 0.02f, hb, hb, frame); if (axis == 1) BXo(x, y, z, hb, 0.02f, hb, frame); if (axis == 2) BXo(x, y, z, hb, hb, 0.02f, frame);
+  if (glow && gPowerOn) { u32 g = rgbCycle(ph); float e = r * 0.9f;                                            // светящееся кольцо
+    if (axis == 2) { BXe(x, y + e, z + 0.01f, e, 0.012f, 0.012f, g); BXe(x, y - e, z + 0.01f, e, 0.012f, 0.012f, g); }
+    if (axis == 1) { BXe(x + e, y - 0.01f, z, 0.012f, 0.012f, e, g); BXe(x - e, y - 0.01f, z, 0.012f, 0.012f, e, g); } }
 }
-static void drawPanel() {
-  char b[128], m[32];
-  int px = IW * 62 / 100, pw = IW - px - fs, py = fs * 14, rowH = imax(fs * 13, (IH - py - fs * 30) / 8);
-  fillRectA(px - fs, py - fs, pw + fs * 2, IH - py + fs, RGB(18, 22, 30), 225);
-  int tw = (pw - fs * 2) / 3; const char *TN[3] = {"ЗАКАЗЫ", "МАГАЗИН", "СКЛАД"};
-  for (int i = 0; i < 3; i++) { if (i == 2) snprintf(b, sizeof b, "СКЛАД (%d)", (int)inv.size()); else snprintf(b, sizeof b, "%s", TN[i]); if (button(px + i * (tw + fs), py, tw, fs * 12, b, true, tab == i ? RGB(70, 110, 170) : RGB(50, 56, 70))) { tab = i; page = 0; } }
-  int y = py + fs * 15;
-  if (tab == 0) {
-    for (int i = 0; i < 3; i++) {
-      Order &o = orders[i]; int h = (IH - y - fs * 4) / 3 - fs;
-      fillRect(px, y, pw, h, i == curOrder ? RGB(40, 60, 40) : RGB(34, 38, 50));
-      snprintf(b, sizeof b, "%s: %s ПК", CNAMES[o.client], OTN[o.type]); drawText(px + fs * 3, y + fs * 3, b, fs, RGB(255, 230, 160), 0);
-      fmtR(m, sizeof m, o.budget); snprintf(b, sizeof b, "БЮДЖЕТ %s", m); drawText(px + fs * 3, y + fs * 12, b, fs, RGB(130, 230, 130), 0);
-      std::string req; if (o.fps) { snprintf(b, sizeof b, "%d FPS В %s, ", o.fps, GAMES[o.game]); req += b; } if (o.cpu) { snprintf(b, sizeof b, "ПРОЦ. %d+, ", o.cpu); req += b; }
-      snprintf(b, sizeof b, "%d ГБ, ДИСК %d", o.ram, o.disk); req += b; if (o.rgb) req += ", RGB";
-      int sc = fs; while (sc > 1 && textW(req.c_str(), sc) > pw - fs * 6) sc--; drawText(px + fs * 3, y + fs * 21, req.c_str(), sc, RGB(200, 205, 220), 0);
-      if (i == curOrder) drawText(px + pw - fs * 3, y + fs * 3, "В РАБОТЕ", fs, RGB(140, 240, 140), 2);
-      else if (curOrder < 0 && button(px + pw - fs * 34, y + h - fs * 13, fs * 31, fs * 11, "ВЗЯТЬ", true, RGB(60, 150, 70))) { curOrder = i; clearBuild(); say("ЗАКАЗ ВЗЯТ: КУПИ ДЕТАЛИ В МАГАЗИНЕ И СОБЕРИ"); saveGame(); }
-      y += h + fs;
-    }
-  } else if (tab == 1) {
-    int cw = (pw - fs * 3) / 4;
-    for (int t = 0; t < NPT; t++) if (button(px + (t % 4) * (cw + fs), y + (t / 4) * (fs * 11), cw, fs * 10, PTN[t], true, shopCat == t ? RGB(70, 110, 170) : RGB(50, 56, 70))) { shopCat = t; page = 0; }
-    y += fs * 23;
-    std::vector<int> list; for (int i = 0; i < NPART; i++) if (PARTS[i].type == shopCat) list.push_back(i);
-    for (size_t k = 0; k < list.size(); k++) {
-      const Part &p = PARTS[list[k]]; int ry = y + (int)k * (rowH + fs / 2); if (ry + rowH > IH - fs) break;
-      bool locked = p.tier > level;
-      fillRect(px, ry, pw, rowH, RGB(34, 38, 50));
-      int sc = fs; while (sc > 1 && textW(p.name, sc) > pw - fs * 40) sc--; drawText(px + fs * 2, ry + rowH / 2 - fs * 3, p.name, sc, locked ? RGB(120, 120, 130) : RGB(235, 235, 240), 0);
-      fmtR(m, sizeof m, p.price);
-      if (locked) { snprintf(b, sizeof b, "УРОВЕНЬ %d", p.tier); drawText(px + pw - fs * 3, ry + rowH / 2 - fs * 3, b, fs, RGB(150, 120, 120), 2); }
-      else if (button(px + pw - fs * 36, ry + fs, fs * 35, rowH - fs * 2, m, money >= p.price, RGB(60, 120, 80))) { money -= p.price; inv.push_back(list[k]); char sb[96]; snprintf(sb, sizeof sb, "КУПЛЕНО: %s (НА СКЛАДЕ)", p.name); say(sb); saveGame(); }
-    }
-    if (shopCat == P_COOLER) { int ry = IH - rowH - fs; if (button(px, ry, pw, rowH, "ТЕРМОПАСТА x3 - 400 Р", money >= 400, RGB(90, 90, 110))) { money -= 400; paste += 3; } }
-  } else {
-    // установлено в корпус - нажми, чтобы снять
-    drawText(px + fs * 2, y, "В КОРПУСЕ (НАЖМИ, ЧТОБЫ СНЯТЬ):", fs, RGB(200, 200, 210), 0); y += fs * 9;
-    int cw = (pw - fs) / 2, n = 0;
-    for (int t = 0; t < NPT; t++) {
-      bool has_ = t == P_RAM ? bd.nram > 0 : bd.part[t] >= 0; if (!has_) continue;
-      if (t == P_RAM) snprintf(b, sizeof b, "ПАМЯТЬ x%d (%d ГБ)", bd.nram, ramGB()); else snprintf(b, sizeof b, "%s", PARTS[bd.part[t]].name);
-      if (button(px + (n % 2) * (cw + fs), y + (n / 2) * (fs * 11), cw, fs * 10, b, true, RGB(70, 60, 50))) removePart(t);
-      n++;
-    }
-    if (!n) { drawText(px + fs * 2, y + fs, "ПУСТО", fs, RGB(140, 140, 150), 0); n = 1; }
-    y += ((n + 1) / 2) * (fs * 11) + fs * 4;
-    drawText(px + fs * 2, y, "СКЛАД (НАЖМИ, ЧТОБЫ ПОСТАВИТЬ):", fs, RGB(200, 200, 210), 0); y += fs * 9;
-    int perPage = imax(1, (IH - y - fs * 14) / (fs * 12)), maxPage = imax(0, ((int)inv.size() - 1) / perPage);
-    page = imin(page, maxPage);
-    for (int k = page * perPage; k < (int)inv.size() && k < (page + 1) * perPage; k++) {
-      const Part &p = PARTS[inv[k]]; int ry = y + (k - page * perPage) * (fs * 12);
-      snprintf(b, sizeof b, "%s: %s", PTN[p.type], p.name);
-      if (button(px, ry, pw - fs * 26, fs * 11, b, true, RGB(50, 70, 100))) { installPart(k); break; }
-      fmtR(m, sizeof m, p.price * 6 / 10); char sb[48]; snprintf(sb, sizeof sb, "ПРОДАТЬ");
-      if (button(px + pw - fs * 25, ry, fs * 25, fs * 11, sb, true, RGB(110, 70, 60))) { money += p.price * 6 / 10; char mb2[96]; snprintf(mb2, sizeof mb2, "ПРОДАНО ЗА %s", m); say(mb2); inv.erase(inv.begin() + k); break; }
-    }
-    if (inv.empty()) drawText(px + fs * 2, y + fs, "ПУСТО: КУПИ ДЕТАЛИ В МАГАЗИНЕ", fs, RGB(140, 140, 150), 0);
-    if (maxPage > 0) { if (button(px, IH - fs * 12, pw / 2 - fs, fs * 11, "< НАЗАД", page > 0, RGB(60, 66, 80))) page--; if (button(px + pw / 2, IH - fs * 12, pw / 2, fs * 11, "ДАЛЬШЕ >", page < maxPage, RGB(60, 66, 80))) page++; }
+static float caseFront() { const Part *c = PP(PT_CASE); return c && c->c == 1 ? 1.55f : 2.25f; }
+static void drawCase(const Part &p) {
+  u32 c = p.col, d = mixc(c, RGB(110, 115, 125), 0.4f); float fz = caseFront(), mz = (fz - 2.25f) * 0.5f, hz = (fz + 2.25f) * 0.5f;
+  BXo(-1.0f, 2.35f, mz, 0.05f, 2.35f, hz, d);                       // стенка под плату
+  BXo(0, 4.65f, mz, 1.05f, 0.05f, hz, c); BXo(0, 0.05f, mz, 1.05f, 0.05f, hz, c);   // верх и низ
+  BXo(0, 2.35f, fz, 1.05f, 2.35f, 0.05f, c);                        // перед
+  BXo(0, 2.35f, -2.25f, 1.05f, 2.35f, 0.05f, c);                    // зад
+  BXo(0, 1.05f, mz, 1.0f, 0.04f, hz - 0.05f, mixc(c, RGB(90, 95, 105), 0.3f));     // кожух блока питания
+  BXo(1.04f, 2.35f, fz - 0.02f, 0.02f, 2.3f, 0.04f, shadec(c, 1.15f)); BXo(1.04f, 4.6f, mz, 0.02f, 0.04f, hz, shadec(c, 1.15f));   // рамка открытого бока
+  for (int k = 0; k < 4; k++) BXo(-0.35f, 4.2f - k * 0.25f, -2.2f, 0.45f, 0.06f, 0.02f, RGB(25, 25, 28));      // задняя решётка
+  if (p.a >= 120) for (int r = 0; r < 7; r++) for (int q = 0; q < 4; q++) BXo(-0.75f + q * 0.5f, 0.6f + r * 0.6f, fz + 0.06f, 0.18f, 0.18f, 0.01f, shadec(c, 0.7f));   // сетка спереди
+  drawFan(-0.3f, 3.9f, -2.15f, 2, 0.48f, RGB(30, 30, 34), RGB(70, 70, 78), p.b != 0, 0.3f);                     // задний вентилятор
+  int nf = p.c == 1 ? 1 : (p.a >= 115 ? 3 : 2); for (int k = 0; k < nf; k++) drawFan(-0.2f, 3.6f - k * 1.15f, fz - 0.12f, 2, 0.5f, RGB(30, 30, 34), RGB(70, 70, 78), p.b != 0, k * 1.1f);
+  if (p.b) { u32 g = gPowerOn ? rgbCycle(0) : RGB(60, 60, 70); BXe(1.0f, 2.35f, fz + 0.03f, 0.03f, 2.2f, 0.03f, g); }        // светодиодная полоса
+  BXo(0.6f, 4.72f, fz - 0.4f, 0.12f, 0.03f, 0.12f, gPowerOn ? RGB(80, 220, 255) : RGB(70, 70, 76));             // кнопка включения
+}
+static float mbTop() { return 4.37f; }
+static void drawMB(const Part &p) {
+  bool mini = p.c == 1; float hy = mini ? 1.22f : 1.52f, cy = mbTop() - hy;
+  BXo(-0.93f, cy, -0.95f, 0.03f, hy, 1.22f, p.col);
+  BXo(-0.9f, 3.75f, -1.0f, 0.02f, 0.29f, 0.29f, RGB(200, 200, 205));                                            // сокет
+  for (int k = 0; k < 4; k++) BXo(-0.89f, 3.6f, -0.37f + k * 0.08f, 0.02f, 0.66f, 0.022f, k & 1 ? RGB(90, 90, 96) : RGB(60, 60, 66));   // слоты памяти
+  BXo(-0.89f, 2.62f, -1.35f, 0.025f, 0.04f, 0.85f, RGB(70, 70, 76)); if (!mini) BXo(-0.89f, 1.9f, -1.35f, 0.025f, 0.04f, 0.85f, RGB(70, 70, 76));   // слоты видеокарты
+  BXo(-0.85f, 4.0f, -2.0f, 0.08f, 0.3f, 0.15f, RGB(60, 60, 66)); BXo(-0.85f, 3.2f, -1.95f, 0.08f, 0.35f, 0.12f, RGB(60, 60, 66));            // радиаторы питания
+  BXo(-0.88f, 2.2f, -0.45f, 0.06f, 0.25f, 0.25f, RGB(80, 80, 88));                                               // чипсет
+  BXo(-0.88f, 2.75f, 0.2f, 0.04f, 0.25f, 0.04f, RGB(230, 230, 230));                                             // разъём 24 pin
+}
+static void drawCPU(const Part &p) { BXo(-0.87f, 3.75f, -1.0f, 0.02f, 0.21f, 0.21f, RGB(185, 180, 165)); BXo(-0.855f, 3.75f, -1.0f, 0.005f, 0.12f, 0.12f, p.col); }
+static void drawCooler(const Part &p) {
+  u32 c = p.col; bool rgb = p.b != 0;
+  switch (p.a) {
+    case 0: BXo(-0.75f, 3.75f, -1.0f, 0.12f, 0.36f, 0.36f, RGB(170, 170, 175)); drawFan(-0.6f, 3.75f, -1.0f, 0, 0.32f, c, RGB(70, 70, 76), false, 0); break;
+    case 1: case 2: { int nt = p.a == 2 ? 2 : 1;
+      for (int t = 0; t < nt; t++) { float z = nt == 2 ? -1.32f + t * 0.64f : -1.0f;
+        BXo(-0.42f, 3.8f, z, 0.45f, 0.55f, 0.2f, RGB(190, 195, 200)); for (int f = 0; f < 6; f++) BXo(-0.42f, 3.35f + f * 0.18f, z, 0.46f, 0.01f, 0.21f, RGB(150, 155, 160));
+        for (int h = 0; h < 3; h++) BXo(-0.42f, 4.38f, z - 0.1f + h * 0.1f, 0.02f, 0.04f, 0.02f, RGB(200, 140, 90)); }   // тепловые трубки
+      drawFan(-0.42f, 3.8f, nt == 2 ? -1.0f : -0.75f, 2, 0.48f, c, nt == 2 ? RGB(40, 40, 44) : RGB(70, 110, 180), rgb, 0.5f); } break;
+    default: { int nf = p.a == 4 ? 3 : 2; float len = nf * 0.6f, zs = -2.0f;                                    // водянка: помпа и радиатор под крышей
+      BXo(-0.78f, 3.75f, -1.0f, 0.1f, 0.27f, 0.27f, c); BXe(-0.67f, 3.75f, -1.0f, 0.01f, 0.15f, 0.15f, gPowerOn ? rgbCycle(1) : RGB(60, 60, 70));
+      BXo(-0.2f, 4.45f, zs + len * 0.5f, 0.6f, 0.1f, len * 0.5f + 0.05f, RGB(35, 35, 40));
+      for (int f = 0; f < nf; f++) drawFan(-0.2f, 4.3f, zs + 0.3f + f * 0.6f, 1, 0.27f, c, RGB(60, 60, 66), rgb, f * 0.7f);
+      BXo(-0.65f, 4.05f, -1.15f, 0.04f, 0.3f, 0.04f, RGB(30, 30, 34)); BXo(-0.6f, 4.05f, -0.85f, 0.04f, 0.3f, 0.04f, RGB(30, 30, 34)); } break;   // шланги
   }
 }
-static void drawOrderCard() {
-  if (curOrder < 0) { const char *t = "ВОЗЬМИ ЗАКАЗ ВО ВКЛАДКЕ \"ЗАКАЗЫ\""; drawTextSh(fs * 4, fs * 17, t, fs, RGB(255, 230, 160), 0); return; }
-  Order &o = orders[curOrder]; ReqLine r[8]; int n = orderReqs(o, r); char b[128];
-  int w = IW * 40 / 100, h = fs * 12 + n * fs * 9; fillRectA(fs * 2, fs * 15, w, h, RGB(10, 14, 22), 120);   // узкая полупрозрачная карточка, чтобы не закрывать корпус
-  snprintf(b, sizeof b, "%s: %s ПК", CNAMES[o.client], OTN[o.type]); drawText(fs * 4, fs * 18, b, fs, RGB(255, 230, 160), 0);
-  for (int i = 0; i < n; i++) { int sc = fs; while (sc > 1 && textW(r[i].text, sc) > w - fs * 14) sc--;
-    fillRect(fs * 4, fs * 27 + i * fs * 9 + fs, fs * 4, fs * 4, r[i].ok ? RGB(70, 200, 90) : RGB(220, 70, 60));
-    drawText(fs * 11, fs * 27 + i * fs * 9, r[i].text, sc, r[i].ok ? RGB(200, 240, 200) : RGB(240, 210, 200), 0); }
+static void drawRAM(const Part &p) {
+  bool rgb = strstr(p.name, "RGB") != NULL;
+  for (int k = 0; k < 2; k++) { float z = -0.33f + k * 0.16f; BXo(-0.76f, 3.6f, z, 0.15f, 0.64f, 0.025f, p.col); BXo(-0.62f, 3.6f, z, 0.01f, 0.5f, 0.027f, shadec(p.col, 1.3f));
+    if (rgb) BXe(-0.6f, 3.6f, z, 0.02f, 0.62f, 0.028f, gPowerOn ? rgbCycle(k * 0.5f) : RGB(200, 200, 210)); }
 }
-static void drawActions() {
-  int ax = fs * 2, aw = (IW * 62 / 100 - fs * 6) / 5, ah = imax(fs * 15, IH / 9), ay = IH - ah - fs; char b[64];
-  snprintf(b, sizeof b, "ТЕРМОПАСТА\n(%d)", paste);
-  if (button(ax, ay, aw - fs, ah, b, bd.part[P_CPU] >= 0 && bd.part[P_COOLER] < 0 && !bd.paste && paste > 0, RGB(110, 110, 130))) { bd.paste = true; paste--; say("ТЕРМОПАСТА НАНЕСЕНА"); }
-  if (button(ax + aw, ay, aw - fs, ah, bd.cables ? "ПРОВОДА ОК" : "ПОДКЛЮЧИТЬ\nПРОВОДА", bd.part[P_PSU] >= 0 && bd.part[P_MB] >= 0 && !bd.cables, RGB(150, 120, 50))) { bd.cables = true; tested = false; say("ПРОВОДА ПОДКЛЮЧЕНЫ"); }
-  if (button(ax + aw * 2, ay, aw - fs, ah, "ТЕСТ", bd.part[P_CASE] >= 0 && testT < 0, RGB(60, 110, 170))) { bd.closed = true; testT = 0; powered = true; powerT = 0; }
-  if (button(ax + aw * 3, ay, aw - fs, ah, "ОТДАТЬ\nКЛИЕНТУ", tested && testBoots && curOrder >= 0, RGB(60, 150, 70))) deliver();
-  if (button(ax + aw * 4, ay, aw - fs, ah, "РАЗОБРАТЬ\nВСЁ", bd.part[P_CASE] >= 0, RGB(120, 60, 50))) { removePart(P_CASE); say("ВСЁ СНЯТО НА СКЛАД"); }
+static void drawSSD(const Part &p) { BXo(-0.89f, 3.02f, -1.0f, 0.012f, 0.1f, 0.42f, RGB(20, 80, 40)); BXo(-0.875f, 3.02f, -1.05f, 0.006f, 0.08f, 0.32f, p.col); BXo(-0.87f, 3.02f, -0.75f, 0.006f, 0.07f, 0.04f, RGB(220, 220, 225)); }
+static void drawGPU(const Part &p) {
+  float L = p.d / 100.0f, z0 = -2.2f, zc = z0 + L * 0.5f; u32 c = p.col;
+  BXo(-0.3f, 2.45f, zc, 0.62f, 0.22f, L * 0.5f, c);                                                                // кожух
+  BXo(-0.3f, 2.69f, zc, 0.6f, 0.02f, L * 0.5f - 0.02f, RGB(30, 30, 34));                                            // бэкплейт
+  BXo(-0.89f, 2.6f, z0 + 0.95f, 0.04f, 0.04f, 0.8f, RGB(200, 170, 70));                                             // разъём в слоте
+  int nf = L > 2.8f ? 3 : (L > 2.0f ? 2 : 1); for (int f = 0; f < nf; f++) drawFan(-0.3f, 2.2f, z0 + L * (f + 0.5f) / nf, 1, fminv(0.5f, L / nf * 0.42f), RGB(25, 25, 28), RGB(60, 60, 66), false, f * 0.9f);
+  BXe(0.33f, 2.5f, zc, 0.01f, 0.05f, L * 0.4f, gPowerOn ? (p.price > 40000 ? rgbCycle(2) : RGB(120, 220, 120)) : shadec(c, 1.4f));   // светящаяся надпись
+  BXo(-0.3f, 2.45f, -2.24f, 0.62f, 0.22f, 0.02f, RGB(170, 170, 175));                                               // планка с выходами
 }
-static void drawTestResult() {
-  if (testT < 0) return;
-  char b[128]; int w = IW * 50 / 100, x = IW * 31 / 100 - w / 2, y = IH / 4, h;
-  if (testT < 1.6f) { const char *t = testT < 0.8f ? "ВКЛЮЧАЕМ..." : "ЗАГРУЗКА СИСТЕМЫ..."; int tw2 = textW(t, fs + 1) + fs * 10; fillRectA(IW * 31 / 100 - tw2 / 2, y, tw2, fs * 14, RGB(0, 0, 0), 190); drawText(IW * 31 / 100, y + fs * 4, t, fs + 1, RGB(255, 255, 255), 1); return; }
-  h = fs * 26 + (int)problems.size() * fs * 9 + (testBoots && curOrder >= 0 ? fs * 18 : 0);
-  fillRectA(x, y, w, h, RGB(8, 12, 20), 225);
-  drawText(x + w / 2, y + fs * 4, testBoots ? "КОМПЬЮТЕР РАБОТАЕТ!" : "НЕ ЗАПУСКАЕТСЯ", fs + 1, testBoots ? RGB(120, 240, 140) : RGB(255, 100, 90), 1);
-  int yy = y + fs * 15;
-  if (testBoots && curOrder >= 0) { Order &o = orders[curOrder];
-    snprintf(b, sizeof b, "ТЕСТ: %d FPS В \"%s\", ПРОЦЕССОР %d", estFps(o.game), GAMES[o.game], (int)cpuScore()); drawText(x + w / 2, yy, b, fs, RGB(220, 230, 255), 1); yy += fs * 9;
-    snprintf(b, sizeof b, "ПАМЯТЬ %d ГБ, ДИСК %d ГБ%s", ramGB(), PT(P_SSD) ? PT(P_SSD)->a : 0, hasRgb() ? ", RGB" : ""); drawText(x + w / 2, yy, b, fs, RGB(220, 230, 255), 1); yy += fs * 9; }
-  for (size_t i = 0; i < problems.size(); i++) { int sc = fs; while (sc > 1 && textW(problems[i].c_str(), sc) > w - fs * 6) sc--; drawText(x + w / 2, yy, problems[i].c_str(), sc, RGB(255, 190, 150), 1); yy += fs * 9; }
-  if (button(x + w / 2 - fs * 20, y + h - fs * 2, fs * 40, fs * 11, "ЗАКРЫТЬ", true, RGB(70, 80, 100))) testT = -1;
+static void drawPSU(const Part &p) {
+  BXo(0.0f, 0.55f, -1.15f, 0.85f, 0.45f, 1.05f, p.col);
+  BXo(0.86f, 0.55f, -1.15f, 0.01f, 0.25f, 0.6f, RGB(220, 220, 225));                                                // наклейка
+  for (int k = 0; k < 5; k++) BXo(0.0f, 0.55f - 0.32f + k * 0.16f, -2.21f, 0.6f, 0.03f, 0.01f, RGB(15, 15, 18));   // решётка сзади
 }
-static void frameGame(float dt) {
-  if (msgT > 0) msgT -= dt;
-  for (size_t i = 0; i < anims.size();) { anims[i].t += dt; if (anims[i].t >= 0.6f) anims.erase(anims.begin() + i); else i++; }
-  if (testT >= 0) { testT += dt; powerT += dt;
-    if (testT >= 1.6f && !tested) { checkBuild(problems, testBoots); tested = true; if (!testBoots) powered = false; } }
-  else if (powered) { powerT += dt; if (powerT > 6) powered = false; }
-  // вращение камеры пальцем по левой части экрана
-  if (P.down && P.sx < IW * 62 / 100 && P.sy > fs * 14 && P.sy < IH - IH / 8) { camYaw += P.dx * 0.008f; camPitch = clampf(camPitch + P.dy * 0.006f, 0.05f, 1.2f); }
-  int vw = IW * 62 / 100;
+static void drawCable(int k) {
+  u32 a = RGB(20, 20, 22), b = RGB(230, 230, 232);
+  if (k == 0) { for (int s = 0; s < 6; s++) BXo(-0.75f, 1.75f + s * 0.17f, 0.42f, 0.09f, 0.085f, 0.07f, s & 1 ? a : b); BXo(-0.82f, 2.75f, 0.32f, 0.06f, 0.2f, 0.07f, a); }   // 24 pin
+  if (k == 1) { BXo(-0.75f, 4.48f, -1.6f, 0.07f, 0.06f, 0.55f, a); BXo(-0.8f, 4.35f, -2.05f, 0.05f, 0.1f, 0.08f, a); }   // процессор 8 pin
+  if (k == 2) { const Part *g = PP(PT_GPU); float L = g ? g->d / 100.0f : 2.5f, z = -2.2f + L - 0.35f; for (int s = 0; s < 4; s++) BXo(-0.1f, 1.25f + s * 0.27f, z, 0.07f, 0.13f, 0.06f, s & 1 ? a : b); }   // видеокарта
+}
+// подсветка места, куда встанет деталь
+static V3 slotPos(int t) {
+  switch (t) { case PT_CASE: return v3(0, 2.3f, 0); case PT_MB: return v3(-0.9f, 2.9f, -0.95f); case PT_CPU: return v3(-0.85f, 3.75f, -1.0f); case PT_COOL: return v3(-0.5f, 3.8f, -1.0f);
+    case PT_RAM: return v3(-0.75f, 3.6f, -0.25f); case PT_SSD: return v3(-0.85f, 3.02f, -1.0f); case PT_GPU: return v3(-0.3f, 2.45f, -0.9f); default: return v3(0, 0.55f, -1.15f); }
+}
+static void drawPC() {
+  OFF = v3(0, 0, 0);
+  const Part *cs = PP(PT_CASE);
+  if (cs) { setOff(partAnim[PT_CASE]); drawCase(*cs); }
+  if (PP(PT_PSU)) { setOff(partAnim[PT_PSU]); drawPSU(*PP(PT_PSU)); }
+  if (PP(PT_MB)) { setOff(partAnim[PT_MB]); drawMB(*PP(PT_MB)); }
+  if (PP(PT_CPU)) { setOff(partAnim[PT_CPU]); drawCPU(*PP(PT_CPU)); }
+  if (PP(PT_SSD)) { setOff(partAnim[PT_SSD]); drawSSD(*PP(PT_SSD)); }
+  if (PP(PT_RAM)) { setOff(partAnim[PT_RAM]); drawRAM(*PP(PT_RAM)); }
+  if (PP(PT_COOL)) { setOff(partAnim[PT_COOL]); drawCooler(*PP(PT_COOL)); }
+  if (PP(PT_GPU)) { setOff(partAnim[PT_GPU]); drawGPU(*PP(PT_GPU)); }
+  for (int k = 0; k < 3; k++) if (S.cab[k]) { float a = easeOut(cabAnim[k]); OFF = v3(0, (1 - a) * -1.2f, 0); drawCable(k); }
+  OFF = v3(0, 0, 0);
+}
+// стол и стена мастерской
+static void drawRoom() {
+  groundQuad(-30, -30, 30, 30, -0.02f, RGB(120, 85, 55));
+  groundQuad(-3.0f, -3.4f, 3.0f, 3.6f, -0.01f, RGB(40, 44, 52));                    // коврик
+  for (int k = 0; k < 12; k++) groundQuad(-30, -30 + k * 5.0f, 30, -29.85f + k * 5.0f, -0.015f, RGB(105, 72, 46));   // доски стола
+  drawBox(v3(-2.6f, 0.06f, 3.0f), v3(0.6f, 0.06f, 0.25f), 0.3f, RGB(200, 60, 50), true);                            // отвёртка
+  drawBox(v3(-2.0f, 0.04f, 3.2f), v3(0.3f, 0.04f, 0.06f), 0.3f, RGB(200, 200, 205), true);
+  drawBox(v3(2.4f, 0.25f, 2.8f), v3(0.35f, 0.25f, 0.35f), 0, RGB(230, 230, 220), true); drawBox(v3(2.4f, 0.5f, 2.8f), v3(0.3f, 0.02f, 0.3f), 0, RGB(110, 70, 40), true);   // кружка
+}
+
+// =====================================================================
+//  СБОРКА ПК: экраны - заказы, магазин, склад, верстак, тест
+// =====================================================================
+enum { GS_TITLE, GS_ORDERS, GS_SHOP, GS_STORE, GS_BENCH };
+static int gs = GS_TITLE;
+enum { SFX_CLICK, SFX_BUY, SFX_PART, SFX_DENY, SFX_ON, SFX_CASH, SFX_FAIL, SFX_CABLE };
+static void sfx(int k);
+static char msg[120]; static float msgT = 0;
+static void say(const char *m, float t = 2.5f) { snprintf(msg, sizeof msg, "%s", m); msgT = t; }
+static int topH() { return fs * 14; }
+static int tabH() { return fs * 17; }
+
+// ---- текст, который не влезает - уменьшаем ----
+static void drawFit(int x, int y, const char *s, int maxw, int sc, u32 col, int al) { while (sc > 1 && textW(s, sc) > maxw) sc--; drawText(x, y, s, sc, col, al); }
+static void panel(int x, int y, int w, int h, u32 c) { fillRect(x, y, w, h, shadec(c, 0.6f)); fillRect(x + 1, y + 1, w - 2, h - 2, c); fillRect(x + 1, y + 1, w - 2, imax(1, fs / 2 + 1), shadec(c, 1.25f)); }
+
+// ---- верхняя полоса и вкладки ----
+static void topBar() {
+  char b[64], m[48]; fillRect(0, 0, IW, topH(), RGB(22, 26, 40)); fillRect(0, topH() - 1, IW, 1, RGB(60, 70, 100));
+  fmtMoney(m, sizeof m, S.money); snprintf(b, sizeof b, "ДЕНЬГИ: %s", m); drawTextSh(fs * 4, fs * 4, b, fs, RGB(120, 230, 140), 0);
+  int lv = repLevel(); snprintf(b, sizeof b, "РЕПУТАЦИЯ: УР. %d", lv); drawTextSh(IW / 2 - fs * 30, fs * 4, b, fs, RGB(255, 210, 120), 0);
+  int bx = IW / 2 + fs * 76, bw = fs * 36; fillRect(bx, fs * 5, bw, fs * 4, RGB(10, 12, 20)); fillRect(bx, fs * 5, lv >= 5 ? bw : bw * (S.rep % 20) / 20, fs * 4, RGB(255, 190, 70));
+  snprintf(b, sizeof b, "ДЕНЬ %d", S.day); drawTextSh(IW - fs * 4, fs * 4, b, fs, RGB(200, 210, 230), 2);
+}
+static void tabsBar() {
+  static const char *TN[4] = {"ЗАКАЗЫ", "МАГАЗИН", "СКЛАД", "ВЕРСТАК"}; static const int TG[4] = {GS_ORDERS, GS_SHOP, GS_STORE, GS_BENCH};
+  int h = tabH(), y = IH - h, w = IW / 4; fillRect(0, y, IW, h, RGB(18, 22, 34));
+  for (int i = 0; i < 4; i++) { bool on = gs == TG[i]; int x = i * w;
+    if (button(x + fs, y + fs, w - fs * 2, h - fs * 2, TN[i], true, on ? RGB(60, 110, 200) : RGB(42, 48, 70))) { gs = TG[i]; sfx(SFX_CLICK); }
+    if (i == 0 && S.active < 0) fillCircle(x + w - fs * 5, y + fs * 4, fs * 2, RGB(255, 80, 60), 255); }
+}
+static void drawMsg() { if (msgT <= 0) return; int w = textW(msg, fs) + fs * 10; fillRectA(IW / 2 - w / 2, IH - tabH() - fs * 16, w, fs * 12, RGB(0, 0, 0), 200); drawText(IW / 2, IH - tabH() - fs * 13, msg, fs, RGB(255, 235, 170), 1); }
+static void bgStripes() { for (int y = 0; y < IH; y += fs * 4) fillRect(0, y, IW, fs * 4, ((y / (fs * 4)) & 1) ? RGB(32, 38, 58) : RGB(30, 35, 54)); }
+
+// =====================================================================
+//  ЗАКАЗЫ
+// =====================================================================
+static void frameOrders() {
+  bgStripes(); topBar(); char b[96], m[48]; Req rq[8];
+  int y0 = topH() + fs * 4, cw = (IW - fs * 16) / 3, ch = IH - tabH() - y0 - fs * 33;
+  drawTextSh(IW / 2, y0, S.active >= 0 ? "ЗАКАЗ В РАБОТЕ - СОБЕРИ ЕГО НА ВЕРСТАКЕ" : "ВЫБЕРИ ЗАКАЗ", fs, RGB(255, 230, 150), 1); y0 += fs * 11;
+  for (int k = 0; k < NOFFER; k++) { Order &o = S.offer[k]; const OrderType &t = OTYPES[o.type]; int x = fs * 4 + k * (cw + fs * 4); bool act = S.active == k;
+    panel(x, y0, cw, ch, act ? RGB(40, 70, 60) : RGB(40, 46, 70));
+    drawFit(x + cw / 2, y0 + fs * 4, t.name, cw - fs * 6, fs + 1, RGB(255, 255, 255), 1);
+    snprintf(b, sizeof b, "КЛИЕНТ: %s", CLIENTS[o.client]); drawFit(x + cw / 2, y0 + fs * 16, b, cw - fs * 6, fs, RGB(190, 200, 225), 1);
+    fmtMoney(m, sizeof m, o.pay); snprintf(b, sizeof b, "ПЛАТИТ %s", m); drawFit(x + cw / 2, y0 + fs * 27, b, cw - fs * 6, fs + 1, RGB(120, 230, 140), 1);
+    int n = orderReqs(o, rq, 0, false), yy = y0 + fs * 41; drawText(x + fs * 5, yy, "НУЖНО:", fs, RGB(255, 210, 120), 0); yy += fs * 10;
+    for (int i = 0; i < n; i++) { drawFit(x + fs * 5, yy, rq[i].text, cw - fs * 10, imax(1, fs - (cw < fs * 120 ? 1 : 0)), RGB(225, 230, 240), 0); yy += fs * 9; }
+    int bh = fs * 15, by = y0 + ch - bh - fs * 4;
+    if (act) { if (button(x + fs * 4, by, cw - fs * 8, bh, "ОТКАЗАТЬСЯ", true, RGB(130, 60, 60))) { S.active = -1; newOrder(o); saveGame(); sfx(SFX_CLICK); say("ЗАКАЗ ОТМЕНЁН"); } }
+    else if (button(x + fs * 4, by, cw - fs * 8, bh, S.active >= 0 ? "СНАЧАЛА СДАЙ ТЕКУЩИЙ" : "ВЗЯТЬ ЗАКАЗ", S.active < 0, RGB(60, 150, 70))) { S.active = k; saveGame(); sfx(SFX_CLICK); say("ЗАКАЗ ВЗЯТ! КУПИ ДЕТАЛИ В МАГАЗИНЕ", 3); } }
+  int by = IH - tabH() - fs * 20, bw = fs * 110;
+  if (button(IW / 2 - bw / 2, by, bw, fs * 15, "НОВЫЙ ДЕНЬ - ДРУГИЕ ЗАКАЗЫ", true, RGB(70, 80, 130))) { S.day++; for (int k = 0; k < NOFFER; k++) if (k != S.active) newOrder(S.offer[k]); saveGame(); sfx(SFX_CLICK); }
+  snprintf(b, sizeof b, "СДАНО ЗАКАЗОВ: %d", S.delivered); drawText(fs * 4, by + fs * 4, b, fs, RGB(170, 180, 200), 0);
+  tabsBar(); drawMsg();
+}
+
+// =====================================================================
+//  МАГАЗИН
+// =====================================================================
+static int shopCat = PT_CPU; static float shopScroll = 0;
+static void frameShop() {
+  bgStripes(); topBar(); char b[96], m[48];
+  int y0 = topH() + fs * 3, cw = (IW - fs * 6) / NPT;
+  for (int t = 0; t < NPT; t++) if (button(fs * 3 + t * cw, y0, cw - fs, fs * 13, PTN[t], true, t == shopCat ? RGB(60, 110, 200) : RGB(45, 52, 78))) { shopCat = t; shopScroll = 0; sfx(SFX_CLICK); }
+  int ly0 = y0 + fs * 16, ly1 = IH - tabH() - fs * 2, rh = fs * 21, n = 0, idx[MAXPART]; for (int i = 0; i < NPART; i++) if (PARTS[i].type == shopCat) idx[n++] = i;
+  static int dragY = -1; static float dragS = 0;
+  if (P.pressed && P.y > ly0 && P.y < ly1) { dragY = P.y; dragS = shopScroll; } if (P.down && dragY >= 0) shopScroll = dragS + (P.y - dragY); if (!P.down) dragY = -1;
+  shopScroll = clampf(shopScroll, (float)imin(0, (ly1 - ly0) - n * rh), 0); bool moved = abs(P.cy - P.sy) > fs * 5;
+  setClipRect(0, ly0, IW, ly1);
+  for (int k = 0; k < n; k++) { int i = idx[k]; const Part &p = PARTS[i]; int y = ly0 + (int)shopScroll + k * rh; if (y + rh < ly0 || y > ly1) continue;
+    bool open = p.tier <= repLevel(); panel(fs * 3, y, IW - fs * 6, rh - fs * 2, open ? RGB(40, 46, 68) : RGB(34, 36, 46));
+    fillRect(fs * 6, y + fs * 3, fs * 12, rh - fs * 8, p.col); fillRect(fs * 8, y + fs * 5, fs * 8, fs * 2, shadec(p.col, 1.5f));
+    drawFit(fs * 22, y + fs * 2, p.name, IW / 2 - fs * 24, fs, open ? RGB(255, 255, 255) : RGB(140, 145, 160), 0);
+    partInfo(i, b, sizeof b); drawFit(fs * 22, y + fs * 11, b, IW / 2 + fs * 20, imax(1, fs - 1), RGB(180, 190, 215), 0);
+    fmtMoney(m, sizeof m, p.price); drawText(IW - fs * 70, y + fs * 6, m, fs, RGB(120, 230, 140), 2);
+    if (S.inv[i] > 0) { snprintf(b, sizeof b, "НА СКЛАДЕ: %d", S.inv[i]); drawText(IW - fs * 70, y + fs * 13, b, imax(1, fs - 1), RGB(200, 200, 140), 2); }
+    int bw = fs * 58, bx = IW - fs * 6 - bw;
+    if (!open) { snprintf(b, sizeof b, "НУЖЕН УРОВЕНЬ %d", p.tier); button(bx, y + fs * 3, bw, rh - fs * 8, b, false, RGB(60, 60, 70)); }
+    else if (button(bx, y + fs * 3, bw, rh - fs * 8, "КУПИТЬ", S.money >= p.price, RGB(60, 150, 70)) && !moved) { S.money -= p.price; S.inv[i]++; saveGame(); sfx(SFX_BUY); snprintf(b, sizeof b, "КУПЛЕНО: %s", p.name); say(b, 1.5f); } }
   setClipRect(0, 0, IW, IH);
-  V3 tgt = v3(0.0f, 0.38f, 0.0f), eye = tgt + v3(sinf(camYaw) * cosf(camPitch), sinf(camPitch), cosf(camYaw) * cosf(camPitch)) * camDist;
-  setCamera(eye, tgt); focal = IW * 0.55f; vcx = vw * 0.58f; vcy = IH * 0.56f;
-  fogCol = RGB(70, 76, 90); fogA = 1e9f; fogB = 2e9f; gLight = 1; gNight = 0; LDIR = vnorm(v3(-0.4f, 0.85f, -0.3f));
-  fillSky(); clearDepth(); drawScene();
-  // верхняя строка
-  char b[96], m[32];
-  fillRectA(0, 0, IW, fs * 13, RGB(14, 16, 22), 220);
-  fmtR(m, sizeof m, money); snprintf(b, sizeof b, "ЗАКАЗ %d   %s", day, m); drawTextSh(fs * 3, fs * 3, b, fs + 1, RGB(150, 240, 150), 0);
-  snprintf(b, sizeof b, "УРОВЕНЬ %d   РЕПУТАЦИЯ %d", level, rep); drawTextSh(fs * 3 + textW("ЗАКАЗ №000   0 000 000 Р", fs + 1) + fs * 10, fs * 3, b, fs + 1, RGB(255, 220, 90), 0);
-  drawOrderCard(); drawActions(); drawPanel(); drawTestResult();
-  if (msgT > 0) { int sc = fs + 1; while (sc > 1 && textW(msg, sc) > vw - fs * 8) sc--; int w = textW(msg, sc) + fs * 8; fillRectA(vw / 2 - w / 2, IH - IH / 8 - fs * 16, w, fs * 12, RGB(0, 0, 0), 180); drawText(vw / 2, IH - IH / 8 - fs * 13, msg, sc, RGB(255, 255, 255), 1); }
+  if (S.active >= 0) { const OrderType &t = OTYPES[S.offer[S.active].type]; snprintf(b, sizeof b, "ЗАКАЗ: %s", t.name); drawText(IW - fs * 4, IH - tabH() - fs * 9, b, imax(1, fs - 1), RGB(255, 220, 140), 2); }
+  tabsBar(); drawMsg();
 }
-enum { GS_TITLE, GS_GAME };
-static int gs = GS_TITLE; static bool hasSave = false;
-static void frameTitle() {
-  int vw = IW; V3 tgt = v3(0, 0.4f, 0), eye = tgt + v3(sinf(gTime * 0.3f) * 1.9f, 0.7f, cosf(gTime * 0.3f) * 1.9f);
-  setClipRect(0, 0, IW, IH); setCamera(eye, tgt); focal = IW * 0.6f; vcx = vw * 0.5f; vcy = IH * 0.55f; fogCol = RGB(40, 44, 56); fogA = 1e9f; fogB = 2e9f; gLight = 1; LDIR = vnorm(v3(-0.4f, 0.85f, -0.3f));
-  fillSky(); clearDepth(); drawScene();
-  fillRectA(0, IH / 12, IW, IH / 4, RGB(0, 0, 0), 150);
-  drawTextSh(IW / 2, IH / 10, "СБОРКА ПК", fs * 3, RGB(120, 200, 255), 1);
-  drawText(IW / 2, IH / 10 + fs * 26, "СОБИРАЙ КОМПЬЮТЕРЫ НА ЗАКАЗ И РАСТИ ОТ ОФИСНЫХ ДО ТОПОВЫХ", fs, RGB(235, 235, 240), 1);
-  int bw = IW / 3, bh = IH / 7, y = IH / 2;
-  if (hasSave) { if (button(IW / 2 - bw / 2, y, bw, bh, "ПРОДОЛЖИТЬ", true, RGB(60, 150, 70))) gs = GS_GAME; y += bh + fs * 3; }
-  if (button(IW / 2 - bw / 2, y, bw, bh, hasSave ? "НОВАЯ ИГРА" : "НАЧАТЬ", true, hasSave ? RGB(120, 80, 60) : RGB(60, 150, 70))) { newGame(); saveGame(); hasSave = true; gs = GS_GAME; say("ВОЗЬМИ ПЕРВЫЙ ЗАКАЗ: ОФИСНЫЙ ПК - САМЫЙ ПРОСТОЙ"); }
+
+// =====================================================================
+//  СКЛАД
+// =====================================================================
+static float storeScroll = 0;
+static void frameStore() {
+  bgStripes(); topBar(); char b[96], m[48];
+  int y0 = topH() + fs * 4; drawTextSh(IW / 2, y0, "ДЕТАЛИ НА СКЛАДЕ. ЛИШНЕЕ МОЖНО ПРОДАТЬ ЗА 60% ЦЕНЫ", fs, RGB(255, 230, 150), 1);
+  int ly0 = y0 + fs * 12, ly1 = IH - tabH() - fs * 2, rh = fs * 17, n = 0, idx[MAXPART]; for (int i = 0; i < NPART; i++) if (S.inv[i] > 0) idx[n++] = i;
+  if (!n) drawText(IW / 2, ly0 + fs * 30, "ПУСТО. КУПИ ДЕТАЛИ В МАГАЗИНЕ", fs + 1, RGB(170, 180, 200), 1);
+  static int dragY = -1; static float dragS = 0;
+  if (P.pressed && P.y > ly0 && P.y < ly1) { dragY = P.y; dragS = storeScroll; } if (P.down && dragY >= 0) storeScroll = dragS + (P.y - dragY); if (!P.down) dragY = -1;
+  storeScroll = clampf(storeScroll, (float)imin(0, (ly1 - ly0) - n * rh), 0); bool moved = abs(P.cy - P.sy) > fs * 5;
+  setClipRect(0, ly0, IW, ly1);
+  for (int k = 0; k < n; k++) { int i = idx[k]; const Part &p = PARTS[i]; int y = ly0 + (int)storeScroll + k * rh; if (y + rh < ly0 || y > ly1) continue;
+    panel(fs * 3, y, IW - fs * 6, rh - fs * 2, RGB(40, 46, 68)); fillRect(fs * 6, y + fs * 3, fs * 10, rh - fs * 8, p.col);
+    snprintf(b, sizeof b, "%s: %s  x%d", PTN[p.type], p.name, S.inv[i]); drawFit(fs * 20, y + fs * 5, b, IW / 2, fs, RGB(255, 255, 255), 0);
+    int sell = p.price * 6 / 10; fmtMoney(m, sizeof m, sell); snprintf(b, sizeof b, "ПРОДАТЬ ЗА %s", m); int bw = fs * 80;
+    if (button(IW - fs * 6 - bw, y + fs * 2, bw, rh - fs * 6, b, true, RGB(140, 90, 50)) && !moved) { S.inv[i]--; S.money += sell; saveGame(); sfx(SFX_CASH); } }
+  setClipRect(0, 0, IW, IH);
+  tabsBar(); drawMsg();
 }
+
+// =====================================================================
+//  ВЕРСТАК
+// =====================================================================
+static float camYaw = 1.3f, camPitch = 0.3f, camDist = 8.2f;
+enum { TS_IDLE, TS_POST, TS_BENCH, TS_DONE, TS_FAIL };
+static int testSt = TS_IDLE; static float testT = 0; static int testScore = 0; static float testTemp = 0; static char failMsg[96];
+static bool removeMode = false; static float listScroll = 0;
+static bool readyToPower(char *miss, int n) {
+  miss[0] = 0; const int need[7] = {PT_CASE, PT_MB, PT_CPU, PT_RAM, PT_SSD, PT_PSU, -1};
+  for (int i = 0; need[i] >= 0; i++) if (S.slot[need[i]] < 0) { snprintf(miss, n, "НЕ ХВАТАЕТ: %s", PTN[need[i]]); return false; }
+  if (!S.cab[0]) { snprintf(miss, n, "ПОДКЛЮЧИ ПИТАНИЕ ПЛАТЫ"); return false; }
+  if (!S.cab[1]) { snprintf(miss, n, "ПОДКЛЮЧИ ПИТАНИЕ ПРОЦЕССОРА"); return false; }
+  if (PP(PT_GPU) && !S.cab[2]) { snprintf(miss, n, "ПОДКЛЮЧИ ПИТАНИЕ ВИДЕОКАРТЫ"); return false; }
+  return true;
+}
+static void startTest() {
+  testSt = TS_POST; testT = 0; gPowerOn = true; sfx(SFX_ON);
+  testScore = buildScore(); testTemp = cpuTemp();
+}
+static void draw3DView(int x0, int y0, int x1, int y1) {
+  for (int y = y0; y < y1; y++) fillRect(x0, y, x1 - x0, 1, mixc(RGB(70, 80, 105), RGB(150, 140, 125), (y - y0) / (float)imax(1, y1 - y0)));   // стена мастерской
+  setClipRect(x0, y0, x1, y1); clearDepth(); gLight = 1.25f; gNight = 0; fogA = 1e9f; fogB = 2e9f; LDIR = vnorm(v3(0.85f, 0.5f, 0.3f));
+  V3 tg = v3(-0.3f, 2.3f, -0.1f), eye = v3(tg.x + sinf(camYaw) * cosf(camPitch) * camDist, tg.y + sinf(camPitch) * camDist, tg.z + cosf(camYaw) * cosf(camPitch) * camDist);
+  setCamera(eye, tg); focal = (y1 - y0) * 1.35f; vcx = (x0 + x1) * 0.5f; vcy = (y0 + y1) * 0.5f;
+  drawRoom(); drawPC();
+  setClipRect(0, 0, IW, IH);
+}
+static void markSlot(int t) {                                         // пульсирующий кружок там, куда ставить
+  V3 p = slotPos(t); int sx, sy; float z; if (!projectPt(p, sx, sy, z)) return; float k = 0.5f + 0.5f * sinf(gTime * 6);
+  fillCircle(sx, sy, (int)(fs * (6 + 3 * k)), RGB(120, 255, 160), (int)(70 + 60 * k)); fillCircle(sx, sy, fs * 2, RGB(255, 255, 255), 200);
+}
+static int nextNeeded() { const int ord[8] = {PT_CASE, PT_MB, PT_CPU, PT_COOL, PT_RAM, PT_SSD, PT_GPU, PT_PSU}; for (int i = 0; i < 8; i++) if (S.slot[ord[i]] < 0) { if (ord[i] == PT_GPU && S.active >= 0 && !OTYPES[S.offer[S.active].type].needGpu) continue; return ord[i]; } return -1; }
+static void deliver() {
+  Order &o = S.offer[S.active]; const OrderType &t = OTYPES[o.type]; int cost = buildCost(); bool great = testScore >= t.minScore * 5 / 4;
+  int pay = o.pay + (great ? o.pay / 10 : 0); S.money += pay; S.rep = imin(200, S.rep + 6 + t.lvl * 2 + (great ? 3 : 0)); S.delivered++; S.best = imax(S.best, testScore);
+  for (int k = 0; k < NPT; k++) S.slot[k] = -1; S.cab[0] = S.cab[1] = S.cab[2] = 0; S.active = -1; newOrder(o);
+  char b[120], m1[48], m2[48]; fmtMoney(m1, sizeof m1, pay); fmtMoney(m2, sizeof m2, pay - cost);
+  snprintf(b, sizeof b, "ЗАКАЗ СДАН! +%s (ПРИБЫЛЬ %s)%s", m1, m2, great ? " + ЧАЕВЫЕ" : ""); say(b, 4); sfx(SFX_CASH);
+  testSt = TS_IDLE; gPowerOn = false; saveGame();
+}
+static void frameBench(float dt) {
+  char b[120], m[48]; int vx1 = IW * 60 / 100, vy0 = topH(), vy1 = IH - tabH();
+  // поворот камеры пальцем по 3D
+  static int lastX = 0, lastY = 0; static bool rot = false;
+  if (P.pressed && P.x < vx1 && P.y > vy0 && P.y < vy1) { rot = true; lastX = P.x; lastY = P.y; }
+  if (rot && P.down) { camYaw = clampf(camYaw - (P.x - lastX) * 0.008f, -0.2f, 2.9f); camPitch = clampf(camPitch + (P.y - lastY) * 0.006f, 0.05f, 1.2f); lastX = P.x; lastY = P.y; }
+  if (!P.down) rot = false;
+  for (int t = 0; t < NPT; t++) partAnim[t] = fminv(1.0f, partAnim[t] + dt * 2.2f); for (int k = 0; k < 3; k++) cabAnim[k] = fminv(1.0f, cabAnim[k] + dt * 2.5f);
+  fanSpeed += ((gPowerOn ? (testSt == TS_BENCH ? 30.0f : 12.0f) : 0.0f) - fanSpeed) * fminv(1.0f, dt * 2); fanSpin += fanSpeed * dt;
+  draw3DView(0, vy0, vx1, vy1);
+  int nn = nextNeeded(); if (testSt == TS_IDLE && nn >= 0) markSlot(nn);
+  drawText(fs * 4, vy0 + fs * 4, "ВЕДИ ПАЛЬЦЕМ, ЧТОБЫ ПОВЕРНУТЬ", imax(1, fs - 1), RGB(230, 235, 245), 0);
+  // ---- тест: загрузка, нагрузка, итог ----
+  if (testSt != TS_IDLE) { testT += dt; int pw = vx1 - fs * 12, ph = fs * 80, px = fs * 6, py = vy1 - ph - fs * 4;
+    fillRectA(px, py, pw, ph, RGB(0, 0, 10), 165);
+    if (testSt == TS_POST) {
+      if (testT > 0.6f && S.slot[PT_PSU] >= 0 && PARTS[S.slot[PT_PSU]].c < powerNeed()) { testSt = TS_FAIL; snprintf(failMsg, sizeof failMsg, "БЛОК ПИТАНИЯ НЕ ТЯНЕТ: НУЖНО %d ВТ, А ОН %d ВТ", powerNeed(), PARTS[S.slot[PT_PSU]].c); gPowerOn = false; sfx(SFX_FAIL); }
+      const char *L[6] = {"BIOS: ПРОВЕРКА...", "ПРОЦЕССОР - OK", "ПАМЯТЬ - OK", "НАКОПИТЕЛЬ - OK", "ЗАГРУЗКА СИСТЕМЫ...", ""};
+      for (int i = 0; i < 5 && i <= (int)(testT * 3); i++) drawText(px + fs * 6, py + fs * 6 + i * fs * 11, L[i], fs, RGB(170, 255, 170), 0);
+      if (testSt == TS_POST && testT > 2.0f) { testSt = TS_BENCH; testT = 0; } }
+    if (testSt == TS_BENCH) { float k = clampf(testT / 4.0f, 0, 1); float temp = 30 + (testTemp - 30) * fminv(1.0f, k * 1.4f);
+      drawTextSh(px + pw / 2, py + fs * 6, "ТЕСТ ПОД НАГРУЗКОЙ", fs + 1, RGB(255, 255, 255), 1);
+      fillRect(px + fs * 8, py + fs * 22, pw - fs * 16, fs * 6, RGB(30, 30, 40)); fillRect(px + fs * 8, py + fs * 22, (int)((pw - fs * 16) * k), fs * 6, RGB(80, 200, 255));
+      snprintf(b, sizeof b, "ОЦЕНКА: %d", (int)(testScore * k)); drawTextSh(px + pw / 2, py + fs * 34, b, fs * 2, RGB(255, 230, 120), 1);
+      snprintf(b, sizeof b, "ПРОЦЕССОР: %d C", (int)temp); drawText(px + pw / 2, py + fs * 56, b, fs + 1, temp > 90 ? RGB(255, 90, 80) : (temp > 80 ? RGB(255, 200, 80) : RGB(140, 255, 160)), 1);
+      snprintf(b, sizeof b, "ПОТРЕБЛЕНИЕ: %d ВТ ИЗ %d", powerNeed(), PARTS[S.slot[PT_PSU]].c); drawText(px + pw / 2, py + fs * 68, b, fs, RGB(200, 210, 230), 1);
+      if (temp > 100 && testTemp > 100) { testSt = TS_FAIL; snprintf(failMsg, sizeof failMsg, "%s", S.slot[PT_COOL] < 0 ? "НЕТ КУЛЕРА - ПРОЦЕССОР ПЕРЕГРЕЛСЯ!" : "КУЛЕР НЕ СПРАВЛЯЕТСЯ - ПЕРЕГРЕВ!"); gPowerOn = false; sfx(SFX_FAIL); }
+      else if (testT > 4.0f) { testSt = TS_DONE; if (testTemp > 90) testScore = testScore * 3 / 4; sfx(SFX_CASH); } }
+    if (testSt == TS_DONE) { drawTextSh(px + pw / 2, py + fs * 6, "ТЕСТ ПРОЙДЕН", fs + 1, RGB(140, 255, 160), 1);
+      snprintf(b, sizeof b, "ОЦЕНКА: %d", testScore); drawTextSh(px + pw / 2, py + fs * 20, b, fs * 2, RGB(255, 230, 120), 1);
+      snprintf(b, sizeof b, "ТЕМПЕРАТУРА %d C%s", (int)testTemp, testTemp > 90 ? " - ГРЕЕТСЯ, ОЦЕНКА НИЖЕ" : ""); drawText(px + pw / 2, py + fs * 40, b, fs, testTemp > 90 ? RGB(255, 160, 80) : RGB(200, 220, 240), 1);
+      fmtMoney(m, sizeof m, buildCost()); snprintf(b, sizeof b, "ДЕТАЛИ СТОЯТ: %s", m); drawText(px + pw / 2, py + fs * 52, b, fs, RGB(200, 220, 240), 1); }
+    if (testSt == TS_FAIL) { drawTextSh(px + pw / 2, py + fs * 10, "ПК ВЫКЛЮЧИЛСЯ!", fs * 2, RGB(255, 100, 90), 1); drawFit(px + pw / 2, py + fs * 34, failMsg, pw - fs * 8, fs, RGB(255, 220, 200), 1);
+      drawText(px + pw / 2, py + fs * 48, "ПОМЕНЯЙ ДЕТАЛЬ И ВКЛЮЧИ СНОВА", fs, RGB(200, 210, 230), 1); } }
+  // ---- правая панель ----
+  int rx = vx1, rw = IW - vx1; fillRect(rx, vy0, rw, vy1 - vy0, RGB(28, 33, 50)); fillRect(rx, vy0, 1, vy1 - vy0, RGB(70, 80, 110));
+  int y = vy0 + fs * 3; Req rq[8];
+  if (S.active >= 0) { const Order &o = S.offer[S.active]; snprintf(b, sizeof b, "ЗАКАЗ: %s", OTYPES[o.type].name); drawFit(rx + fs * 4, y, b, rw - fs * 8, fs, RGB(255, 220, 140), 0); y += fs * 10;
+    int n = orderReqs(o, rq, testSt == TS_DONE ? testScore : 0, testSt == TS_DONE);
+    for (int i = 0; i < n; i++) { snprintf(b, sizeof b, "%s %s", rq[i].ok ? "+" : "-", rq[i].text); drawFit(rx + fs * 4, y, b, rw - fs * 8, imax(1, fs - 1), rq[i].ok ? RGB(140, 240, 150) : RGB(220, 170, 160), 0); y += fs * 8; }
+    fmtMoney(m, sizeof m, buildCost()); char m2[48]; fmtMoney(m2, sizeof m2, o.pay); snprintf(b, sizeof b, "ДЕТАЛИ %s ИЗ %s", m, m2); drawFit(rx + fs * 4, y, b, rw - fs * 8, imax(1, fs - 1), buildCost() > o.pay ? RGB(255, 120, 100) : RGB(170, 200, 230), 0); y += fs * 10; }
+  else { drawFit(rx + fs * 4, y, "СВОБОДНАЯ СБОРКА (ВОЗЬМИ ЗАКАЗ)", rw - fs * 8, fs, RGB(200, 210, 230), 0); y += fs * 12; }
+  int bh = fs * 13, bw = rw - fs * 8, bx = rx + fs * 4;
+  if (testSt == TS_DONE || testSt == TS_FAIL) {
+    bool ok = false; if (testSt == TS_DONE && S.active >= 0) { ok = true; int n = orderReqs(S.offer[S.active], rq, testScore, true); for (int i = 0; i < n; i++) if (!rq[i].ok) ok = false; }
+    if (S.active >= 0 && testSt == TS_DONE) { if (button(bx, y, bw, bh + fs * 4, ok ? "СДАТЬ ЗАКАЗ" : "НЕ ПОДХОДИТ ПОД ЗАКАЗ", ok, RGB(60, 160, 70))) { deliver(); return; } y += bh + fs * 7; }
+    if (button(bx, y, bw, bh, "ВЫКЛЮЧИТЬ И ДОРАБОТАТЬ", true, RGB(70, 80, 130))) { testSt = TS_IDLE; gPowerOn = false; sfx(SFX_CLICK); } y += bh + fs * 3;
+    tabsBar(); drawMsg(); return; }
+  if (testSt != TS_IDLE) { tabsBar(); drawMsg(); return; }
+  // кнопки режима
+  int hw = (bw - fs * 2) / 2;
+  if (button(bx, y, hw, fs * 11, "ПОСТАВИТЬ", true, !removeMode ? RGB(60, 110, 200) : RGB(45, 52, 78))) { removeMode = false; listScroll = 0; }
+  if (button(bx + hw + fs * 2, y, hw, fs * 11, "СНЯТЬ", true, removeMode ? RGB(160, 80, 60) : RGB(45, 52, 78))) { removeMode = true; listScroll = 0; }
+  y += fs * 14;
+  int ly0 = y, ly1 = vy1 - fs * 38, rh = fs * 15;
+  struct Row { int kind, id; bool ok; char why[96]; }; static Row rows[MAXPART + 8]; int nr = 0;
+  if (!removeMode) {
+    for (int k = 0; k < 3; k++) { bool can = !S.cab[k] && S.slot[PT_PSU] >= 0 && (k == 0 ? S.slot[PT_MB] >= 0 : (k == 1 ? S.slot[PT_CPU] >= 0 : S.slot[PT_GPU] >= 0)); if (can) { rows[nr].kind = 1; rows[nr].id = k; rows[nr].ok = true; rows[nr].why[0] = 0; nr++; } }
+    for (int pass = 0; pass < 2; pass++) for (int i = 0; i < NPART; i++) if (S.inv[i] > 0) { char w[96]; bool ok = canInstall(i, w, sizeof w); if (ok != (pass == 0)) continue; rows[nr].kind = 0; rows[nr].id = i; rows[nr].ok = ok; snprintf(rows[nr].why, 96, "%s", w); nr++; }
+  } else for (int t = 0; t < NPT; t++) if (S.slot[t] >= 0) { rows[nr].kind = 2; rows[nr].id = t; rows[nr].ok = true; rows[nr].why[0] = 0; nr++; }
+  if (!nr) drawFit(bx, ly0 + fs * 4, removeMode ? "НИЧЕГО НЕ УСТАНОВЛЕНО" : "НА СКЛАДЕ ПУСТО - КУПИ ДЕТАЛИ", bw, imax(1, fs - 1), RGB(170, 180, 200), 0);
+  static int dragY = -1; static float dragS = 0;
+  if (P.pressed && P.x > rx && P.y > ly0 && P.y < ly1) { dragY = P.y; dragS = listScroll; } if (P.down && dragY >= 0) listScroll = dragS + (P.y - dragY); if (!P.down) dragY = -1;
+  listScroll = clampf(listScroll, (float)imin(0, (ly1 - ly0) - nr * rh), 0); bool moved = abs(P.cy - P.sy) > fs * 5;
+  setClipRect(rx, ly0, IW, ly1);
+  for (int r = 0; r < nr; r++) { int yy = ly0 + (int)listScroll + r * rh; if (yy + rh < ly0 || yy > ly1) continue; Row &R = rows[r];
+    if (R.kind == 1) { static const char *CN[3] = {"ПРОВОД: ПИТАНИЕ ПЛАТЫ", "ПРОВОД: ПИТАНИЕ ПРОЦЕССОРА", "ПРОВОД: ПИТАНИЕ ВИДЕОКАРТЫ"};
+      if (button(bx, yy, bw, rh - fs * 2, CN[R.id], true, RGB(150, 120, 40)) && !moved) { S.cab[R.id] = 1; cabAnim[R.id] = 0; saveGame(); sfx(SFX_CABLE); } }
+    else if (R.kind == 0) { if (S.inv[R.id] <= 0) continue; const Part &p = PARTS[R.id]; snprintf(b, sizeof b, "%s x%d", p.name, S.inv[R.id]);
+      if (button(bx, yy, bw, rh - fs * 2, b, true, R.ok ? RGB(50, 120, 80) : RGB(70, 60, 64)) && !moved) {
+        if (R.ok) { S.inv[R.id]--; S.slot[p.type] = R.id; partAnim[p.type] = 0; saveGame(); sfx(SFX_PART); } else { say(R.why, 3); sfx(SFX_DENY); } } }
+    else { if (S.slot[R.id] < 0) continue; const Part &p = PARTS[S.slot[R.id]]; snprintf(b, sizeof b, "СНЯТЬ: %s", p.name);   /* могла сняться вместе с другой в этом кадре */
+      if (button(bx, yy, bw, rh - fs * 2, b, true, RGB(140, 70, 60)) && !moved) { uninstall(R.id); saveGame(); sfx(SFX_CLICK); } } }
+  setClipRect(0, 0, IW, IH);
+  // подсказка и включение
+  y = ly1 + fs * 3; char miss[96]; bool ready = readyToPower(miss, sizeof miss);
+  if (!ready) { const char *hint = miss; char hb[96];
+    if (nn >= 0 && !removeMode) { bool have = false; for (int i = 0; i < NPART; i++) if (S.inv[i] > 0 && PARTS[i].type == nn) have = true; snprintf(hb, sizeof hb, have ? "ПОСТАВЬ: %s" : "КУПИ В МАГАЗИНЕ: %s", PTN[nn]); hint = hb; }
+    drawFit(bx, y, hint, bw, imax(1, fs - 1), RGB(255, 220, 140), 0); }
+  else drawFit(bx, y, S.slot[PT_COOL] < 0 ? "БЕЗ КУЛЕРА ПК ПЕРЕГРЕЕТСЯ!" : "ВСЁ ГОТОВО - ВКЛЮЧАЙ!", bw, imax(1, fs - 1), S.slot[PT_COOL] < 0 ? RGB(255, 140, 110) : RGB(140, 240, 150), 0);
+  y += fs * 10;
+  if (button(bx, y, bw, fs * 18, "ВКЛЮЧИТЬ", ready, RGB(60, 160, 70))) startTest();
+  tabsBar(); drawMsg();
+}
+
+// =====================================================================
+//  ЗАСТАВКА: крутится собранный топовый ПК
+// =====================================================================
+static void frameTitle(float dt) {
+  int saved[NPT], cab[3]; for (int t = 0; t < NPT; t++) { saved[t] = S.slot[t]; partAnim[t] = 1; } for (int k = 0; k < 3; k++) { cab[k] = S.cab[k]; S.cab[k] = 1; cabAnim[k] = 1; }
+  const char *demo[NPT] = {"БАШНЯ RGB", "ПЛАТА Б-790 ЭКСТРИМ", "ВЕКТОР В9", "ВОДЯНКА 360 RGB", "DDR5 64 ГБ RGB", "SSD 2 ТБ", "ГРОМ 4090 ТИТАН", "БП 1300 ВТ"};
+  for (int t = 0; t < NPT; t++) for (int i = 0; i < NPART; i++) if (!strcmp(PARTS[i].name, demo[t])) S.slot[t] = i;
+  bool po = gPowerOn; gPowerOn = true; fanSpeed = 12; fanSpin += dt * 12; float cy = camYaw, cp = camPitch; camYaw = 1.15f + sinf(gTime * 0.3f) * 0.55f; camPitch = 0.28f; float cd = camDist; camDist = 9.5f;
+  draw3DView(0, 0, IW, IH);
+  camYaw = cy; camPitch = cp; camDist = cd; gPowerOn = po; for (int t = 0; t < NPT; t++) S.slot[t] = saved[t]; for (int k = 0; k < 3; k++) S.cab[k] = cab[k];
+  fillRectA(0, 0, IW, IH / 4, RGB(0, 0, 0), 120);
+  drawTextSh(IW / 2, fs * 8, "СБОРКА ПК", fs * 4, RGB(120, 220, 255), 1);
+  drawText(IW / 2, fs * 40, "МАСТЕРСКАЯ КОМПЬЮТЕРОВ: ЗАКАЗЫ, ДЕТАЛИ, СБОРКА, ТЕСТ", fs, RGB(230, 235, 245), 1);
+  int bw = fs * 90, bh = fs * 22;
+  if (button(IW / 2 - bw / 2, IH - bh - fs * 30, bw, bh, "ИГРАТЬ", true, RGB(60, 160, 70))) { gs = S.active >= 0 ? GS_BENCH : GS_ORDERS; sfx(SFX_CLICK); }
+  if (button(IW / 2 - bw / 2, IH - fs * 24, bw, fs * 16, S.soundOn ? "ЗВУК: ВКЛ" : "ЗВУК: ВЫКЛ", true, RGB(70, 80, 130))) { S.soundOn = !S.soundOn; saveGame(); }
+}
+
+// =====================================================================
+//  СБОРКА ПК: звук, ввод, главный цикл
+// =====================================================================
+struct Voice { float f0, f1, t, dur, vol, ph; int noise; };
+static Voice voices[10]; static volatile int vHead = 0; static bool audioOk = false;
+static void audioCb(void *, Uint8 *st, int len) {
+  short *o = (short *)st; int n = len / 2; static unsigned rs = 777u;
+  for (int i = 0; i < n; i++) { float v = 0;
+    for (int k = 0; k < 10; k++) { Voice &vc = voices[k]; if (vc.dur <= 0 || vc.t >= vc.dur) continue; float k01 = vc.t / vc.dur, env = (1 - k01) * (1 - k01) * vc.vol, f = vc.f0 + (vc.f1 - vc.f0) * k01;
+      if (vc.noise) { rs = rs * 1664525u + 1013904223u; float nz = ((rs >> 9) & 0xFFFF) / 32768.0f - 1.0f; vc.ph += (nz - vc.ph) * 0.3f; v += vc.ph * env; }
+      else { vc.ph += f / 22050.0f; if (vc.ph > 1) vc.ph -= 1; v += sinf(vc.ph * 6.2832f) * 0.6f * env + (vc.ph < 0.5f ? 0.2f : -0.2f) * env; }
+      vc.t += 1.0f / 22050.0f; }
+    if (v > 1) v = 1; if (v < -1) v = -1; o[i] = (short)(v * 13000); }
+}
+static void audioInit() {
+  if (audioOk) return; SDL_InitSubSystem(SDL_INIT_AUDIO);
+  SDL_AudioSpec want; memset(&want, 0, sizeof want); want.freq = 22050; want.format = AUDIO_S16SYS; want.channels = 1; want.samples = 1024; want.callback = audioCb;
+  if (SDL_OpenAudio(&want, NULL) == 0) { audioOk = true; SDL_PauseAudio(0); }
+}
+static void voice(float f0, float f1, float dur, float vol, int noise) { if (!audioOk || !S.soundOn) return; int k = vHead; vHead = (vHead + 1) % 10; Voice v; v.f0 = f0; v.f1 = f1; v.t = 0; v.dur = dur; v.vol = vol; v.ph = 0; v.noise = noise; voices[k] = v; }
+static void sfx(int k) {
+  switch (k) {
+    case SFX_CLICK: voice(900, 700, 0.05f, 0.3f, 0); break;
+    case SFX_BUY: voice(700, 1100, 0.12f, 0.35f, 0); break;
+    case SFX_PART: voice(0, 0, 0.08f, 0.45f, 1); voice(220, 160, 0.1f, 0.35f, 0); break;       // щелчок защёлки
+    case SFX_CABLE: voice(0, 0, 0.05f, 0.4f, 1); voice(1200, 900, 0.04f, 0.2f, 0); break;
+    case SFX_DENY: voice(220, 180, 0.15f, 0.4f, 0); break;
+    case SFX_ON: voice(1000, 1000, 0.15f, 0.35f, 0); break;                                         // «пик» при включении
+    case SFX_CASH: voice(800, 800, 0.08f, 0.35f, 0); voice(1200, 1600, 0.25f, 0.3f, 0); break;
+    case SFX_FAIL: voice(300, 100, 0.5f, 0.5f, 0); voice(0, 0, 0.3f, 0.3f, 1); break;
+  }
+}
+// ---- ввод: один палец ----
+static long long ptrId = -99;
+static void fingerDown(long long id, int x, int y) { if (P.down) return; ptrId = id; P.down = true; P.pressed = true; P.x = P.sx = x; P.y = P.sy = y; }
+static void fingerMove(long long id, int x, int y) { if (!P.down || id != ptrId) return; P.dx += x - P.x; P.dy += y - P.y; P.x = x; P.y = y; }
+static void fingerUp(long long id, int x, int y) { if (!P.down || id != ptrId) return; P.down = false; P.x = x; P.y = y; P.cx = x; P.cy = y; P.clicked = true; }
+static void goBack(bool &running) { if (gs == GS_TITLE) running = false; else if (gs == GS_BENCH && testSt != TS_IDLE) { testSt = TS_IDLE; gPowerOn = false; } else gs = GS_TITLE; saveGame(); }
+static float fpsShow = 0, fpsAcc = 0; static int fpsN = 0;
 
 int main(int argc, char **argv) {
   (void)argc; (void)argv;
-  if (!gfxInit()) return 1;
 #if defined(__ANDROID__) && defined(SDL_MAJOR_VERSION) && SDL_MAJOR_VERSION >= 2
   { const char *ip = SDL_AndroidGetInternalStoragePath(); if (ip && *ip) snprintf(gBase, sizeof gBase, "%s/", ip); }
 #endif
-  rotMode = SH > SW; LW = rotMode ? SH : SW; LH = rotMode ? SW : SH;
+  SDL_SetHint("SDL_ANDROID_TRAP_BACK_BUTTON", "1");
+  if (!gfxInit()) return 1;
+  rotMode = false; LW = SW; LH = SH;
   computeSize(); if (!allocBuffers()) return 1;
   srand((unsigned)time(NULL));
-  newGame(); hasSave = loadGame(); if (!hasSave) newGame();
+  if (!loadGame()) { FILE *old = fopen(pth("sborka.sav"), "rb"); if (old) { fclose(old); rename(pth("sborka.sav"), pth("sborka.broken")); } newGame(); saveGame(); }
+  for (int t = 0; t < NPT; t++) partAnim[t] = 1; for (int k = 0; k < 3; k++) cabAnim[k] = 1;
+  audioInit();
   memset(&P, 0, sizeof P);
   bool running = true; Uint32 last = SDL_GetTicks();
   while (running) {
     Uint32 now = SDL_GetTicks();
     float dt = clampf((now - last) / 1000.0f, 0.001f, 0.05f); last = now; gTime += dt;
-    if (gfxCheckResize()) { rotMode = SH > SW; LW = rotMode ? SH : SW; LH = rotMode ? SW : SH; computeSize(); if (!allocBuffers()) break; }
+    if (gfxCheckResize()) { rotMode = false; LW = SW; LH = SH; computeSize(); if (!allocBuffers()) break; }
     P.pressed = false; P.clicked = false; P.dx = P.dy = 0;
+#if SDL_MODE == 2
+    SDL_Event ev;
+    while (SDL_PollEvent(&ev)) {
+      int mx, my;
+      switch (ev.type) {
+        case SDL_QUIT: running = false; break;
+        case SDL_APP_WILLENTERBACKGROUND: case SDL_APP_TERMINATING: case SDL_APP_LOWMEMORY: saveGame(); break;
+        case SDL_KEYDOWN: if (ev.key.keysym.sym == SDLK_ESCAPE
+#if defined(__ANDROID__)
+          || ev.key.keysym.sym == SDLK_AC_BACK
+#endif
+          ) goBack(running); break;
+        case SDL_FINGERDOWN: mapPt((int)(ev.tfinger.x * SW), (int)(ev.tfinger.y * SH), mx, my); fingerDown((long long)ev.tfinger.fingerId, mx, my); break;
+        case SDL_FINGERMOTION: mapPt((int)(ev.tfinger.x * SW), (int)(ev.tfinger.y * SH), mx, my); fingerMove((long long)ev.tfinger.fingerId, mx, my); break;
+        case SDL_FINGERUP: mapPt((int)(ev.tfinger.x * SW), (int)(ev.tfinger.y * SH), mx, my); fingerUp((long long)ev.tfinger.fingerId, mx, my); break;
+        case SDL_MOUSEBUTTONDOWN: if (ev.button.which != SDL_TOUCH_MOUSEID) { mapPt(ev.button.x, ev.button.y, mx, my); fingerDown(-1, mx, my); } break;
+        case SDL_MOUSEMOTION: if (ev.motion.which != SDL_TOUCH_MOUSEID) { mapPt(ev.motion.x, ev.motion.y, mx, my); fingerMove(-1, mx, my); } break;
+        case SDL_MOUSEBUTTONUP: if (ev.button.which != SDL_TOUCH_MOUSEID) { mapPt(ev.button.x, ev.button.y, mx, my); fingerUp(-1, mx, my); } break;
+        default: break;
+      }
+    }
+#else
     Ev e;
     while (pollEv(e)) {
       if (e.type == 0) running = false;
-      else if (e.type == 5) { if (gs == GS_GAME) saveGame(); }
-      else if (e.type == 4) { if (gs == GS_TITLE) running = false; else if (testT >= 0) testT = -1; else { saveGame(); gs = GS_TITLE; } }
-      else {
-        int mx, my; mapPt(e.x, e.y, mx, my);
-        if (e.type == 1) { P.down = true; P.pressed = true; P.x = P.sx = mx; P.y = P.sy = my; }
-        else if (e.type == 3) { if (P.down) { P.dx += mx - P.x; P.dy += my - P.y; } P.x = mx; P.y = my; }
-        else if (e.type == 2) { P.x = mx; P.y = my; P.cx = mx; P.cy = my; P.down = false; if (abs(mx - P.sx) + abs(my - P.sy) < fs * 8) P.clicked = true; }
-      }
+      else if (e.type == 4) goBack(running);
+      else if (e.type == 5) saveGame();
+      else { int mx, my; mapPt(e.x, e.y, mx, my); if (e.type == 1) fingerDown(-1, mx, my); else if (e.type == 3) fingerMove(-1, mx, my); else fingerUp(-1, mx, my); }
     }
-    if (gs == GS_TITLE) frameTitle(); else frameGame(dt);
+#endif
+    if (msgT > 0) msgT -= dt;
+    switch (gs) { case GS_TITLE: frameTitle(dt); break; case GS_ORDERS: frameOrders(); break; case GS_SHOP: frameShop(); break; case GS_STORE: frameStore(); break; default: frameBench(dt); break; }
+    if (fpsOn) { char b[16]; snprintf(b, sizeof b, "%d", (int)(fpsShow + 0.5f)); drawText(IW - fs * 2, IH - fs * 9, b, imax(1, fs - 1), RGB(150, 160, 180), 2); }
     gfxPresent();
-    Uint32 spent = SDL_GetTicks() - now; if (spent < 16) SDL_Delay(16 - spent);
+    Uint32 spent = SDL_GetTicks() - now; fpsAcc += dt; fpsN++; if (fpsAcc >= 1.0f) { fpsShow = fpsN / fpsAcc; fpsAcc = 0; fpsN = 0; }
+    if (spent < 16) SDL_Delay(16 - spent);
   }
-  if (gs == GS_GAME) saveGame();
-  gfxQuit();
+  saveGame(); gfxQuit();
   return 0;
 }
